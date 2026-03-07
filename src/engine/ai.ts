@@ -2,14 +2,12 @@
  * Chess AI Engine
  * ---------------
  * Implements a classical minimax search with:
- *  - Alpha-beta pruning
- *  - Iterative deepening
- *  - Move ordering (captures first, then quiet moves scored by piece-square tables)
+ *  - Alpha-beta pruning (negamax formulation)
+ *  - Iterative deepening  
+ *  - Transposition table (Zobrist hash based)
+ *  - Move ordering (TT hit, check, MVV-LVA, promotion)
  *  - Piece-square tables for positional evaluation
  *  - Quiescence search to avoid horizon effect
- *
- * To replace with your own AI: export a function matching the signature:
- *   getBestMove(state: GameState, depthMs?: number): Promise<Move>
  */
 
 import type { GameState, Move } from './types';
@@ -18,119 +16,107 @@ import { applyMove, getAllLegalMoves, isInCheck, pieceType, pieceColor, getGameR
 // ─── Piece values ─────────────────────────────────────────────────────────────
 
 const PIECE_VALUE: Record<string, number> = {
-  P: 100, N: 320, B: 330, R: 500, Q: 900, K: 20000,
+  P: 100, N: 320, B: 330, R: 500, Q: 900, K: 0,
 };
 
-// ─── Piece-Square Tables (white's perspective; rows 0=rank8, 7=rank1) ─────────
+// ─── Piece-Square Tables (flattened, white's perspective, a1=0, h1=7, a8=56, h8=63) ─────────
 
-const PST: Record<string, number[][]> = {
-  P: [
-    [ 0,  0,  0,  0,  0,  0,  0,  0],
-    [50, 50, 50, 50, 50, 50, 50, 50],
-    [10, 10, 20, 30, 30, 20, 10, 10],
-    [ 5,  5, 10, 25, 25, 10,  5,  5],
-    [ 0,  0,  0, 20, 20,  0,  0,  0],
-    [ 5, -5,-10,  0,  0,-10, -5,  5],
-    [ 5, 10, 10,-20,-20, 10, 10,  5],
-    [ 0,  0,  0,  0,  0,  0,  0,  0],
-  ],
-  N: [
-    [-50,-40,-30,-30,-30,-30,-40,-50],
-    [-40,-20,  0,  0,  0,  0,-20,-40],
-    [-30,  0, 10, 15, 15, 10,  0,-30],
-    [-30,  5, 15, 20, 20, 15,  5,-30],
-    [-30,  0, 15, 20, 20, 15,  0,-30],
-    [-30,  5, 10, 15, 15, 10,  5,-30],
-    [-40,-20,  0,  5,  5,  0,-20,-40],
-    [-50,-40,-30,-30,-30,-30,-40,-50],
-  ],
-  B: [
-    [-20,-10,-10,-10,-10,-10,-10,-20],
-    [-10,  0,  0,  0,  0,  0,  0,-10],
-    [-10,  0,  5, 10, 10,  5,  0,-10],
-    [-10,  5,  5, 10, 10,  5,  5,-10],
-    [-10,  0, 10, 10, 10, 10,  0,-10],
-    [-10, 10, 10, 10, 10, 10, 10,-10],
-    [-10,  5,  0,  0,  0,  0,  5,-10],
-    [-20,-10,-10,-10,-10,-10,-10,-20],
-  ],
-  R: [
-    [ 0,  0,  0,  0,  0,  0,  0,  0],
-    [ 5, 10, 10, 10, 10, 10, 10,  5],
-    [-5,  0,  0,  0,  0,  0,  0, -5],
-    [-5,  0,  0,  0,  0,  0,  0, -5],
-    [-5,  0,  0,  0,  0,  0,  0, -5],
-    [-5,  0,  0,  0,  0,  0,  0, -5],
-    [-5,  0,  0,  0,  0,  0,  0, -5],
-    [ 0,  0,  0,  5,  5,  0,  0,  0],
-  ],
-  Q: [
-    [-20,-10,-10, -5, -5,-10,-10,-20],
-    [-10,  0,  0,  0,  0,  0,  0,-10],
-    [-10,  0,  5,  5,  5,  5,  0,-10],
-    [ -5,  0,  5,  5,  5,  5,  0, -5],
-    [  0,  0,  5,  5,  5,  5,  0, -5],
-    [-10,  5,  5,  5,  5,  5,  0,-10],
-    [-10,  0,  5,  0,  0,  0,  0,-10],
-    [-20,-10,-10, -5, -5,-10,-10,-20],
-  ],
-  K_MG: [
-    [-30,-40,-40,-50,-50,-40,-40,-30],
-    [-30,-40,-40,-50,-50,-40,-40,-30],
-    [-30,-40,-40,-50,-50,-40,-40,-30],
-    [-30,-40,-40,-50,-50,-40,-40,-30],
-    [-20,-30,-30,-40,-40,-30,-30,-20],
-    [-10,-20,-20,-20,-20,-20,-20,-10],
-    [ 20, 20,  0,  0,  0,  0, 20, 20],
-    [ 20, 30, 10,  0,  0, 10, 30, 20],
-  ],
-  K_EG: [
-    [-50,-40,-30,-20,-20,-30,-40,-50],
-    [-30,-20,-10,  0,  0,-10,-20,-30],
-    [-30,-10, 20, 30, 30, 20,-10,-30],
-    [-30,-10, 30, 40, 40, 30,-10,-30],
-    [-30,-10, 30, 40, 40, 30,-10,-30],
-    [-30,-10, 20, 30, 30, 20,-10,-30],
-    [-30,-30,  0,  0,  0,  0,-30,-30],
-    [-50,-30,-30,-30,-30,-30,-30,-50],
-  ],
+const PAWN_PST = [0,0,0,0,0,0,0,0,50,50,50,50,50,50,50,50,10,10,20,30,30,20,10,10,5,5,10,25,25,10,5,5,0,0,0,20,20,0,0,0,5,-5,-10,0,0,-10,-5,5,5,10,10,-20,-20,10,10,5,0,0,0,0,0,0,0,0];
+const KNIGHT_PST = [-50,-40,-30,-30,-30,-30,-40,-50,-40,-20,0,0,0,0,-20,-40,-30,0,10,15,15,10,0,-30,-30,5,15,20,20,15,5,-30,-30,0,15,20,20,15,0,-30,-30,5,10,15,15,10,5,-30,-40,-20,0,5,5,0,-20,-40,-50,-40,-30,-30,-30,-30,-40,-50];
+const BISHOP_PST = [-20,-10,-10,-10,-10,-10,-10,-20,-10,5,0,0,0,0,5,-10,-10,10,10,10,10,10,10,-10,-10,0,10,10,10,10,0,-10,-10,5,5,10,10,5,5,-10,-10,0,5,10,10,5,0,-10,-10,0,0,0,0,0,0,-10,-20,-10,-10,-10,-10,-10,-10,-20];
+const ROOK_PST = [0,0,0,5,5,0,0,0,-5,0,0,0,0,0,0,-5,-5,0,0,0,0,0,0,-5,-5,0,0,0,0,0,0,-5,-5,0,0,0,0,0,0,-5,-5,0,0,0,0,0,0,-5,5,10,10,10,10,10,10,5,0,0,0,0,0,0,0,0];
+const QUEEN_PST = [-20,-10,-10,-5,-5,-10,-10,-20,-10,0,5,0,0,0,0,-10,-10,5,5,5,5,5,0,-10,-5,0,5,5,5,5,0,-5,0,0,5,5,5,5,0,-5,-10,5,5,5,5,5,0,-10,-10,0,5,0,0,0,0,-10,-20,-10,-10,-5,-5,-10,-10,-20];
+const KING_PST = [-30,-40,-40,-50,-50,-40,-40,-30,-30,-40,-40,-50,-50,-40,-40,-30,-30,-40,-40,-50,-50,-40,-40,-30,-30,-40,-40,-50,-50,-40,-40,-30,-20,-30,-30,-40,-40,-30,-30,-20,-10,-20,-20,-20,-20,-20,-20,-10,20,20,0,0,0,0,20,20,20,30,10,0,0,10,30,20];
+
+const PST_BY_PIECE: Record<string, number[]> = {
+  P: PAWN_PST, N: KNIGHT_PST, B: BISHOP_PST, R: ROOK_PST, Q: QUEEN_PST, K: KING_PST
 };
 
-function getPST(pt: string, color: 'w' | 'b', r: number, c: number, isEndgame: boolean): number {
-  const table = pt === 'K' ? (isEndgame ? PST.K_EG : PST.K_MG) : PST[pt];
-  if (!table) return 0;
-  const row = color === 'w' ? r : 7 - r;
-  return table[row][c];
+// ─── Zobrist Hashing ─────────────────────────────────────────────────────────
+
+const ZOBRIST_PIECES = new Uint32Array(12 * 64);
+const ZOBRIST_BLACK = 1n << 32n;
+const ZOBRIST_SIDE = BigInt('0x123456789ABCDEF0');
+
+function initZobrist() {
+  for (let i = 0; i < ZOBRIST_PIECES.length; i++) {
+    ZOBRIST_PIECES[i] = Math.floor(Math.random() * 0x100000000);
+  }
+}
+initZobrist();
+
+function computeZobrist(state: GameState): bigint {
+  let hash = 0n;
+  
+  // Board pieces
+  for (let r = 0; r < 8; r++) {
+    for (let c = 0; c < 8; c++) {
+      const p = state.board[r][c];
+      if (p) {
+        const pt = pieceType(p);
+        const pc = pieceColor(p);
+        const pieceIdx = (pc === 'w' ? 0 : 6) + 'PNBRQK'.indexOf(pt);
+        const sq = r * 8 + c;
+        hash ^= BigInt(ZOBRIST_PIECES[pieceIdx * 64 + sq]);
+      }
+    }
+  }
+  
+  // Side to move
+  if (state.turn === 'b') hash ^= ZOBRIST_SIDE;
+  
+  return hash;
+}
+
+// ─── Transposition Table ─────────────────────────────────────────────────────
+
+interface TTEntry {
+  depth: number;
+  score: number;
+  flag: 0 | 1 | 2; // 0=exact, 1=lowerbound, 2=upperbound
+  move?: Move;
+}
+
+const TT_SIZE = 1 << 20; // 1M entries
+const TT = new Map<bigint, TTEntry>();
+
+function getTTMove(hash: bigint): Move | undefined {
+  const entry = TT.get(hash);
+  return entry?.move;
+}
+
+function storeTT(hash: bigint, depth: number, score: number, flag: 0 | 1 | 2, move?: Move) {
+  if (!TT.has(hash) || depth >= (TT.get(hash)?.depth ?? 0)) {
+    TT.set(hash, { depth, score, flag, move });
+    if (TT.size > TT_SIZE) {
+      // Simple eviction: remove oldest
+      const firstKey = TT.keys().next().value;
+      TT.delete(firstKey);
+    }
+  }
 }
 
 // ─── Evaluation ───────────────────────────────────────────────────────────────
-
-function isEndgame(state: GameState): boolean {
-  let queens = 0, minors = 0;
-  for (let r = 0; r < 8; r++) for (let c = 0; c < 8; c++) {
-    const p = state.board[r][c];
-    if (!p) continue;
-    if (p[1] === 'Q') queens++;
-    if (p[1] === 'N' || p[1] === 'B') minors++;
-  }
-  return queens === 0 || (queens === 2 && minors <= 2);
-}
 
 export function evaluate(state: GameState): number {
   const result = getGameResult(state);
   if (result === 'checkmate') return state.turn === 'w' ? -99999 : 99999;
   if (result === 'stalemate' || result === 'draw-50') return 0;
 
-  const eg = isEndgame(state);
   let score = 0;
-
+  
   for (let r = 0; r < 8; r++) {
     for (let c = 0; c < 8; c++) {
       const p = state.board[r][c];
       if (!p) continue;
-      const color = p[0] as 'w' | 'b';
-      const pt = p[1];
-      const val = (PIECE_VALUE[pt] ?? 0) + getPST(pt, color, r, c, eg);
+      
+      const color = pieceColor(p);
+      const pt = pieceType(p);
+      const sq = r * 8 + c;
+      
+      const pst = color === 'b' ? PST_BY_PIECE[pt][63 - sq] : PST_BY_PIECE[pt][sq];
+      const val = (PIECE_VALUE[pt] ?? 0) + pst;
+      
       score += color === 'w' ? val : -val;
     }
   }
@@ -140,78 +126,101 @@ export function evaluate(state: GameState): number {
 
 // ─── Move ordering ────────────────────────────────────────────────────────────
 
-function scoreMoveForOrdering(move: Move): number {
-  let score = 0;
+function scoreMoveForOrdering(state: GameState, move: Move, ttMove?: Move): number {
+  if (ttMove && areMovesEqual(move, ttMove)) return 1000000;
+  
+  if (isInCheck(applyMove(state, move))) return 50000;
+  
   if (move.captured) {
     const attacker = PIECE_VALUE[move.piece[1]] ?? 0;
     const victim = PIECE_VALUE[move.captured[1]] ?? 0;
-    score += 10 * victim - attacker + 10000; // MVV-LVA
+    return 10000 + (victim * 10 - attacker);
   }
-  if (move.promotion) score += PIECE_VALUE[move.promotion] + 5000;
-  if (move.castling) score += 500;
-  return score;
+  
+  if (move.promotion) return 20000 + PIECE_VALUE[move.promotion ?? 'Q'];
+  
+  return 0;
 }
 
-function orderMoves(moves: Move[]): Move[] {
-  return [...moves].sort((a, b) => scoreMoveForOrdering(b) - scoreMoveForOrdering(a));
+function areMovesEqual(a: Move, b: Move): boolean {
+  return a.from.r === b.from.r && a.from.c === b.from.c &&
+         a.to.r === b.to.r && a.to.c === b.to.c &&
+         a.promotion === b.promotion;
+}
+
+function orderMoves(state: GameState, moves: Move[], ttMove?: Move): Move[] {
+  return [...moves].sort((a, b) => 
+    scoreMoveForOrdering(state, b, ttMove) - scoreMoveForOrdering(state, a, ttMove)
+  );
 }
 
 // ─── Quiescence search ────────────────────────────────────────────────────────
 
-function quiescence(state: GameState, alpha: number, beta: number, maxDepth: number): number {
+function quiescence(state: GameState, alpha: number, beta: number): number {
   const stand = evaluate(state);
-  if (maxDepth <= 0) return stand;
   if (stand >= beta) return beta;
   if (stand > alpha) alpha = stand;
 
-  const captures = getAllLegalMoves(state).filter(m => m.captured || m.promotion);
-  for (const move of orderMoves(captures)) {
+  const forcingMoves = getAllLegalMoves(state).filter(m => 
+    m.captured || isInCheck(applyMove(state, m))
+  );
+  
+  for (const move of orderMoves(state, forcingMoves)) {
     const next = applyMove(state, move);
-    const score = -quiescence(next, -beta, -alpha, maxDepth - 1);
+    const score = -quiescence(next, -beta, -alpha);
     if (score >= beta) return beta;
     if (score > alpha) alpha = score;
   }
   return alpha;
 }
 
-// ─── Minimax with alpha-beta ──────────────────────────────────────────────────
+// ─── Negamax with alpha-beta pruning ─────────────────────────────────────────
 
 let nodesSearched = 0;
 
-function alphaBeta(state: GameState, depth: number, alpha: number, beta: number, maximizing: boolean): number {
+function negamax(state: GameState, depth: number, alpha: number, beta: number): number {
   nodesSearched++;
-
-  if (depth === 0) return quiescence(state, alpha, beta, 4);
-
+  
+  const hash = computeZobrist(state);
+  const ttEntry = TT.get(hash);
+  
+  // TT lookup
+  if (ttEntry && ttEntry.depth >= depth) {
+    if (ttEntry.flag === 0) return ttEntry.score; // exact
+    if (ttEntry.flag === 1 && ttEntry.score >= beta) return ttEntry.score; // lowerbound
+    if (ttEntry.flag === 2 && ttEntry.score <= alpha) return ttEntry.score; // upperbound
+  }
+  
+  const ttMove = ttEntry?.move;
+  
   const result = getGameResult(state);
   if (result !== 'ongoing') {
-    if (result === 'checkmate') return maximizing ? -99999 - depth : 99999 + depth;
+    if (result === 'checkmate') return -99999;
     return 0;
   }
-
-  const moves = orderMoves(getAllLegalMoves(state));
-
-  if (maximizing) {
-    let best = -Infinity;
-    for (const move of moves) {
-      const next = applyMove(state, move);
-      const score = alphaBeta(next, depth - 1, alpha, beta, false);
-      best = Math.max(best, score);
-      alpha = Math.max(alpha, score);
-      if (alpha >= beta) break;
-    }
-    return best;
-  } else {
-    let best = Infinity;
-    for (const move of moves) {
-      const next = applyMove(state, move);
-      const score = alphaBeta(next, depth - 1, alpha, beta, true);
-      best = Math.min(best, score);
-      beta = Math.min(beta, score);
-      if (alpha >= beta) break;
-    }
-    return best;
+  
+  if (depth === 0) return quiescence(state, alpha, beta);
+  
+  let bestScore = -Infinity;
+  
+  const moves = orderMoves(state, getAllLegalMoves(state), ttMove);
+  for (const move of moves) {
+    const next = applyMove(state, move);
+    const score = -negamax(next, depth - 1, -beta, -alpha);
+    
+    if (score > bestScore) bestScore = score;
+    if (bestScore > alpha) alpha = bestScore;
+    if (alpha >= beta) break;
   }
+  
+  // Store in TT
+  let flag = 0; // exact
+  if (bestScore <= alpha) flag = 2; // upperbound
+  else if (bestScore >= beta) flag = 1; // lowerbound
+  
+  storeTT(hash, depth, bestScore, flag, moves[0]); // store first (best) move
+  
+  return bestScore;
 }
 
 // ─── Public API ───────────────────────────────────────────────────────────────
@@ -223,63 +232,59 @@ export interface AIResult {
   nodes: number;
 }
 
-/**
- * Get the best move for the current player using iterative deepening.
- * @param state  The current game state
- * @param timeLimitMs  How long to think (default 1500ms)
- * @returns The best move found
- *
- * ── HOW TO REPLACE WITH YOUR OWN AI ──────────────────────────────────────────
- * Export a function with this signature from your own module, then update the
- * import in src/hooks/useChessGame.ts:
- *
- *   export async function getBestMove(state: GameState, timeLimitMs?: number): Promise<AIResult>
- *
- * Your function receives the full GameState and should return an AIResult with
- * at minimum a valid `move` field. The move must be a legal move for state.turn.
- * ─────────────────────────────────────────────────────────────────────────────
- */
 export async function getBestMove(state: GameState, timeLimitMs = 1500): Promise<AIResult> {
   return new Promise(resolve => {
-    // Use setTimeout to not block the main thread
     setTimeout(() => {
       const start = Date.now();
       nodesSearched = 0;
-
-      const moves = orderMoves(getAllLegalMoves(state));
+      
+      const hash = computeZobrist(state);
+      TT.clear(); // Clear TT for new search
+      
+      const moves = getAllLegalMoves(state);
       if (moves.length === 0) throw new Error('No legal moves');
       if (moves.length === 1) {
         resolve({ move: moves[0], score: 0, depth: 0, nodes: 1 });
         return;
       }
-
-      const isMax = state.turn === 'w';
+      
       let bestMove = moves[0];
-      let bestScore = isMax ? -Infinity : Infinity;
+      let bestScore = -Infinity;
       let completedDepth = 0;
-
-      // Iterative deepening: increase depth until time runs out
-      for (let depth = 1; depth <= 6; depth++) {
-        let depthBest = moves[0];
-        let depthBestScore = isMax ? -Infinity : Infinity;
-
-        for (const move of moves) {
-          const next = applyMove(state, move);
-          const score = alphaBeta(next, depth - 1, -Infinity, Infinity, !isMax);
-
-          if (isMax ? score > depthBestScore : score < depthBestScore) {
-            depthBestScore = score;
-            depthBest = move;
-          }
-        }
-
-        bestMove = depthBest;
-        bestScore = depthBestScore;
-        completedDepth = depth;
-
+      
+      // Iterative deepening
+      for (let depth = 1; depth <= 8; depth++) {
         if (Date.now() - start > timeLimitMs) break;
+        
+        let depthBestMove = moves[0];
+        let depthBestScore = -Infinity;
+        let alpha = -Infinity;
+        let beta = Infinity;
+        
+        const ttMove = getTTMove(hash);
+        const ordered = orderMoves(state, moves, ttMove);
+        
+        for (const move of ordered) {
+          if (Date.now() - start > timeLimitMs) break;
+          
+          const next = applyMove(state, move);
+          const score = -negamax(next, depth - 1, -beta, -alpha);
+          
+          if (score > depthBestScore) {
+            depthBestScore = score;
+            depthBestMove = move;
+          }
+          
+          if (score > alpha) alpha = score;
+        }
+        
+        if (depthBestMove) {
+          bestMove = depthBestMove;
+          bestScore = depthBestScore;
+          completedDepth = depth;
+        }
       }
-
+      
       resolve({ move: bestMove, score: bestScore, depth: completedDepth, nodes: nodesSearched });
     }, 10);
   });
