@@ -1,7 +1,7 @@
-import { useState, useCallback, useRef } from 'react';
+import { useState, useCallback, useRef, useEffect } from 'react';
 import type { GameState, Move, Piece, Square, Color } from '../engine/types';
 import { parseFEN, INITIAL_FEN, getLegalMoves, applyMove, getGameResult, isInCheck, moveToAlg, squareToAlg, pieceColor, pieceType } from '../engine/chess';
-import { getBestMove } from '../engine/ai';
+import { getBestMove, initAI } from '../engine/ai';
 
 export type GamePhase = 'playing' | 'checkmate' | 'stalemate' | 'draw-50' | 'draw-repetition';
 
@@ -12,6 +12,7 @@ export interface HistoryEntry {
   capturedPiece?: Piece;
   aiDepth?: number;
   aiNodes?: number;
+  aiScore?: number;
 }
 
 export interface ChessGameState {
@@ -26,9 +27,12 @@ export interface ChessGameState {
   aiThinking: boolean;
   aiDepth: number;
   aiNodes: number;
+  aiScore: number;
   inCheck: boolean;
   promotionPending: { from: Square; to: Square } | null;
   shakeSq: string | null;
+  aiInitialized: boolean;
+  aiInitError: string | null;
 }
 
 export interface ChessGameActions {
@@ -36,6 +40,7 @@ export interface ChessGameActions {
   completePromotion: (piece: 'Q' | 'R' | 'B' | 'N') => void;
   resetGame: () => void;
   undoMove: () => void;
+  setAIDifficulty: (timeMs: number) => void;
 }
 
 function getPhase(state: GameState): GamePhase {
@@ -48,6 +53,10 @@ function getPhase(state: GameState): GamePhase {
 
 const PLAYER_COLOR: Color = 'w';
 const AI_COLOR: Color = 'b';
+const DEFAULT_AI_TIME = 1500; // ms
+
+// Hardcoded path to your trained model - CHANGE THIS TO YOUR ACTUAL PATH
+const TRAINED_MODEL_PATH = '/best_network.nnue'; // Place your .nnue file in public folder
 
 export function useChessGame(): ChessGameState & ChessGameActions {
   const [gameState, setGameState] = useState<GameState>(() => parseFEN(INITIAL_FEN));
@@ -61,10 +70,32 @@ export function useChessGame(): ChessGameState & ChessGameActions {
   const [aiThinking, setAiThinking] = useState(false);
   const [aiDepth, setAiDepth] = useState(0);
   const [aiNodes, setAiNodes] = useState(0);
+  const [aiScore, setAiScore] = useState(0);
   const [promotionPending, setPromotionPending] = useState<{ from: Square; to: Square } | null>(null);
   const [shakeSq, setShakeSq] = useState<string | null>(null);
+  const [aiInitialized, setAiInitialized] = useState(false);
+  const [aiInitError, setAiInitError] = useState<string | null>(null);
+  const [aiTimeMs, setAiTimeMs] = useState(DEFAULT_AI_TIME);
 
   const stateHistoryRef = useRef<GameState[]>([parseFEN(INITIAL_FEN)]);
+  const abortControllerRef = useRef<AbortController | null>(null);
+
+  // Initialize AI on mount with hardcoded path
+  useEffect(() => {
+    const loadAI = async () => {
+      try {
+        console.log('Loading trained chess model from', TRAINED_MODEL_PATH);
+        await initAI(TRAINED_MODEL_PATH);
+        setAiInitialized(true);
+        setAiInitError(null);
+        console.log('AI initialized successfully with trained model!');
+      } catch (error) {
+        console.error('Failed to initialize AI:', error);
+        setAiInitError(error instanceof Error ? error.message : 'Failed to load AI model');
+      }
+    };
+    loadAI();
+  }, []);
 
   const triggerShake = (sq: Square) => {
     const key = `${sq[0]}-${sq[1]}`;
@@ -73,10 +104,19 @@ export function useChessGame(): ChessGameState & ChessGameActions {
   };
 
   const triggerAI = useCallback(async (currentState: GameState) => {
+    if (!aiInitialized) {
+      console.warn('AI not initialized yet, using fallback?');
+    }
+
     setAiThinking(true);
+    
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+    }
+    
     try {
-      const result = await getBestMove(currentState, 1500);
-      const { move } = result;
+      const result = await getBestMove(currentState, aiTimeMs);
+      const { move, score, depth, nodes } = result;
 
       const nextState = applyMove(currentState, move);
       const nextPhase = getPhase(nextState);
@@ -86,8 +126,9 @@ export function useChessGame(): ChessGameState & ChessGameActions {
       setGameState(nextState);
       setPhase(nextPhase);
       setLastMove(move);
-      setAiDepth(result.depth);
-      setAiNodes(result.nodes);
+      setAiDepth(depth);
+      setAiNodes(nodes);
+      setAiScore(score);
 
       if (move.captured) {
         setCapturedByBlack(prev => [...prev, move.captured!]);
@@ -98,15 +139,20 @@ export function useChessGame(): ChessGameState & ChessGameActions {
         alg: moveToAlg(move),
         fen: '',
         capturedPiece: move.captured,
-        aiDepth: result.depth,
-        aiNodes: result.nodes,
+        aiDepth: depth,
+        aiNodes: nodes,
+        aiScore: score,
       }]);
     } catch (err) {
-      console.error('AI error:', err);
+      if (err instanceof Error && err.name === 'AbortError') {
+        console.log('AI search cancelled');
+      } else {
+        console.error('AI error:', err);
+      }
     } finally {
       setAiThinking(false);
     }
-  }, []);
+  }, [aiTimeMs, aiInitialized]);
 
   const executePlayerMove = useCallback((move: Move, currentState: GameState) => {
     const nextState = applyMove(currentState, move);
@@ -144,24 +190,20 @@ export function useChessGame(): ChessGameState & ChessGameActions {
     const piece = gameState.board[r][c];
     const pc = pieceColor(piece);
 
-    // If we have a selection, try to move
     if (selected) {
       const [sr, sc] = selected;
 
-      // Deselect if same square
       if (sr === r && sc === c) {
         setSelected(null);
         setLegalMovesForSelected([]);
         return;
       }
 
-      // Try to move to this square
       const moveCandidates = legalMovesForSelected.filter(
         m => m.to[0] === r && m.to[1] === c
       );
 
       if (moveCandidates.length > 0) {
-        // Check if pawn promotion
         if (moveCandidates.some(m => m.promotion)) {
           setPromotionPending({ from: [sr, sc], to: [r, c] });
           return;
@@ -170,7 +212,6 @@ export function useChessGame(): ChessGameState & ChessGameActions {
         return;
       }
 
-      // Re-select own piece
       if (pc === PLAYER_COLOR) {
         const moves = getLegalMoves(gameState, r, c);
         if (moves.length === 0) {
@@ -184,14 +225,12 @@ export function useChessGame(): ChessGameState & ChessGameActions {
         return;
       }
 
-      // Invalid target
       triggerShake(sq);
       setSelected(null);
       setLegalMovesForSelected([]);
       return;
     }
 
-    // Select own piece
     if (pc === PLAYER_COLOR) {
       const moves = getLegalMoves(gameState, r, c);
       if (moves.length === 0) {
@@ -230,14 +269,22 @@ export function useChessGame(): ChessGameState & ChessGameActions {
     setAiThinking(false);
     setAiDepth(0);
     setAiNodes(0);
+    setAiScore(0);
     setPromotionPending(null);
     setShakeSq(null);
+    
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+    }
   }, []);
 
   const undoMove = useCallback(() => {
-    // Undo 2 moves (player + AI) to get back to player's turn
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+    }
+
     const hist = stateHistoryRef.current;
-    if (hist.length < 3) return; // need at least initial + player + ai
+    if (hist.length < 3) return;
     stateHistoryRef.current = hist.slice(0, hist.length - 2);
     const prev = stateHistoryRef.current[stateHistoryRef.current.length - 1];
     setGameState(prev);
@@ -245,7 +292,11 @@ export function useChessGame(): ChessGameState & ChessGameActions {
     setSelected(null);
     setLegalMovesForSelected([]);
     setHistory(h => h.slice(0, h.length - 2));
-    // Recompute captures from remaining history
+    setAiThinking(false);
+    setAiDepth(0);
+    setAiNodes(0);
+    setAiScore(0);
+    
     const newHistEntries = history.slice(0, history.length - 2);
     const wb: Piece[] = [], bb: Piece[] = [];
     for (const e of newHistEntries) {
@@ -259,6 +310,10 @@ export function useChessGame(): ChessGameState & ChessGameActions {
     const lastH = newHistEntries[newHistEntries.length - 1];
     setLastMove(lastH?.move ?? null);
   }, [history]);
+
+  const setAIDifficulty = useCallback((timeMs: number) => {
+    setAiTimeMs(timeMs);
+  }, []);
 
   const inCheck = isInCheck(gameState, gameState.turn);
 
@@ -274,12 +329,16 @@ export function useChessGame(): ChessGameState & ChessGameActions {
     aiThinking,
     aiDepth,
     aiNodes,
+    aiScore,
     inCheck,
     promotionPending,
     shakeSq,
+    aiInitialized,
+    aiInitError,
     selectSquare,
     completePromotion,
     resetGame,
     undoMove,
+    setAIDifficulty,
   };
 }
