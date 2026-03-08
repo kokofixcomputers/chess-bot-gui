@@ -1,209 +1,260 @@
 /**
- * FIXED Chess AI Engine - FULLY COMPATIBLE WITH YOUR TRAINING DATA
- * Uses ALL 784 features + Policy Head for 30% faster checkmates
+ * Chess AI Engine (fixed)
+ * -----------------------
+ * - Negamax with alpha–beta pruning
+ * - Iterative deepening
+ * - Zobrist hashing + transposition table
+ * - NNUE evaluation using all available input features (768 or 784)
  */
 
 import type { GameState, Move } from './types';
-import { applyMove, getAllLegalMoves, isInCheck, pieceType, pieceColor, getGameResult } from './chess';
+import {
+  applyMove,
+  getAllLegalMoves,
+  isInCheck,
+  pieceType,
+  pieceColor,
+  getGameResult,
+} from './chess';
 
-// ─── Piece values (fallback) ──────────────────────────────────────────────────
+// ─── Piece values (fallback for ordering) ─────────────────────────────────────
 
 const PIECE_VALUE: Record<string, number> = {
-  P: 100, N: 320, B: 330, R: 500, Q: 900, K: 0,
+  P: 100,
+  N: 320,
+  B: 330,
+  R: 500,
+  Q: 900,
+  K: 0,
 };
 
-// ─── FIXED NNUE (784 INPUTS + POLICY HEAD) ─────────────────────────────────────
+// ─── NNUE Evaluator ───────────────────────────────────────────────────────────
 
 interface NNUEWeights {
-  fc1_weight: Float32Array[];  // [256][784] ← FIXED: YOUR 784 features
-  fc1_bias: Float32Array;      // [256]
-  fc2_weight: Float32Array;    // Value head [256]
+  fc1_weight: Float32Array[]; // [256][inputSize]
+  fc1_bias: Float32Array;     // [256]
+  fc2_weight: Float32Array;   // [256]
   fc2_bias: number;
-  policy_weight: Float32Array; // NEW: Policy head [256][24]
-  policy_bias: Float32Array;   // [24]
 }
 
-class FixedNNUEEvaluator {
+class NNUEEvaluator {
   private weights: NNUEWeights | null = null;
   private accumulator: Float32Array = new Float32Array(256);
-  
-  // YOUR EXACT 784 feature indices from Python trainer
+  private inputSize = 768; // 12 * 64; may become 784 if model uses extra features
+
   private pieceMap: Record<string, number> = {
-    'wP': 0, 'wN': 1, 'wB': 2, 'wR': 3, 'wQ': 4, 'wK': 5,
-    'bP': 6, 'bN': 7, 'bB': 8, 'bR': 9, 'bQ': 10, 'bK': 11
+    wP: 0,
+    wN: 1,
+    wB: 2,
+    wR: 3,
+    wQ: 4,
+    wK: 5,
+    bP: 6,
+    bN: 7,
+    bB: 8,
+    bR: 9,
+    bQ: 10,
+    bK: 11,
   };
 
   public async loadWeights(url: string): Promise<void> {
-    const response = await fetch(url);
-    const buffer = await response.arrayBuffer();
+    const resp = await fetch(url);
+    const buffer = await resp.arrayBuffer();
     const data = new DataView(buffer);
     let offset = 0;
-    
-    // Header check
-    if (String.fromCharCode(data.getUint8(0), data.getUint8(1), data.getUint8(2), data.getUint8(3)) !== 'NNUE') {
-      throw new Error('Invalid NNUE file');
+
+    // Header "NNUE"
+    const magic =
+      String.fromCharCode(data.getUint8(0)) +
+      String.fromCharCode(data.getUint8(1)) +
+      String.fromCharCode(data.getUint8(2)) +
+      String.fromCharCode(data.getUint8(3));
+    if (magic !== 'NNUE') {
+      throw new Error('Invalid NNUE file header');
     }
     offset += 4;
-    
-    const version = data.getInt32(offset, true); offset += 4;
+
+    const version = data.getInt32(offset, true);
+    offset += 4;
     console.log(`Loading NNUE v${version}`);
-    
-    // SAFER reading with bounds checking
-    const readInt32 = (off: number): number => {
-      if (off + 4 > buffer.byteLength) throw new Error(`Buffer too small at ${off}`);
-      return data.getInt32(off, true);
+
+    const readInt32 = () => {
+      const v = data.getInt32(offset, true);
+      offset += 4;
+      return v;
     };
-    
-    const readFloat32Array = (off: number, len: number): Float32Array => {
-      if (off + len * 4 > buffer.byteLength) throw new Error(`Buffer overflow at ${off}`);
-      return new Float32Array(buffer, off, len);
+    const readFloat32Array = (len: number) => {
+      const arr = new Float32Array(buffer, offset, len);
+      offset += len * 4;
+      return arr;
     };
-    
-    // fc1_weight [256][784]
-    const fc1_len = readInt32(offset); offset += 4;
+
+    // fc1_weight: flattened [256 * inputSize]
+    const fc1_len = readInt32();
+    const inferredInputSize = fc1_len / 256;
+    if (!Number.isInteger(inferredInputSize)) {
+      throw new Error(`fc1_len ${fc1_len} not divisible by 256`);
+    }
+    this.inputSize = inferredInputSize;
     const fc1_weight: Float32Array[] = [];
     for (let i = 0; i < 256; i++) {
-      const start = offset + i * 784 * 4;
-      fc1_weight[i] = readFloat32Array(start, 784);
+      const row = new Float32Array(buffer, offset + i * this.inputSize * 4, this.inputSize);
+      fc1_weight.push(row);
     }
     offset += fc1_len * 4;
-    
+
     // fc1_bias [256]
-    const fc1_bias_len = readInt32(offset); offset += 4;
-    const fc1_bias = readFloat32Array(offset, fc1_bias_len); offset += fc1_bias_len * 4;
-    
+    const fc1_bias_len = readInt32();
+    if (fc1_bias_len !== 256) {
+      console.warn(`Unexpected fc1_bias_len=${fc1_bias_len}, expected 256`);
+    }
+    const fc1_bias = readFloat32Array(fc1_bias_len);
+
     // fc2_weight [256]
-    const fc2_weight_len = readInt32(offset); offset += 4;
-    const fc2_weight = readFloat32Array(offset, fc2_weight_len); offset += fc2_weight_len * 4;
-    
+    const fc2_weight_len = readInt32();
+    if (fc2_weight_len !== 256) {
+      console.warn(`Unexpected fc2_weight_len=${fc2_weight_len}, expected 256`);
+    }
+    const fc2_weight = readFloat32Array(fc2_weight_len);
+
     // fc2_bias [1]
-    const fc2_bias = data.getFloat32(offset, true); offset += 4;
-    
-    // Skip policy weights (use fallback if missing)
-    try {
-      const policy_weight_len = readInt32(offset); offset += 4;
-      const policy_weight = readFloat32Array(offset, policy_weight_len / 256); offset += policy_weight_len * 4;
-      const policy_bias_len = readInt32(offset); offset += 4;
-      const policy_bias = readFloat32Array(offset, policy_bias_len);
-      
-      this.weights = { fc1_weight, fc1_bias, fc2_weight, fc2_bias, policy_weight, policy_bias };
-    } catch (e) {
-      console.warn('Policy head missing - using fallback');
-      this.weights = { fc1_weight, fc1_bias, fc2_weight, fc2_bias, policy_weight: new Float32Array(0), policy_bias: new Float32Array(0) };
-    }
-    
-    console.log('✅ FIXED NNUE loaded successfully!');
+    const fc2_bias = data.getFloat32(offset, true);
+    offset += 4;
+
+    this.weights = { fc1_weight, fc1_bias, fc2_weight, fc2_bias };
+    console.log(`NNUE weights loaded, inputSize=${this.inputSize}`);
   }
 
+  /**
+   * Build feature vector from board and move number, then run first NNUE layer.
+   * Returns the feature vector (for debugging if needed).
+   */
+  public setPosition(state: GameState, ply: number): Float32Array {
+    if (!this.weights) {
+      this.accumulator.fill(0);
+      return new Float32Array(this.inputSize);
+    }
 
-  public setPosition(state: GameState, moveNumber: number = 0): Float32Array {
-    if (!this.weights) return new Float32Array(784);
-    
-    const features = new Float32Array(784);
-    
-    // PIECES (0-767) - YOUR EXACT Python order
-    for (let r = 0; r < 8; r++) {
-      for (let c = 0; c < 8; c++) {
-        const piece = state.board[r][c];
-        if (!piece) continue;
-        
-        const pc = pieceColor(piece);
-        const pt = pieceType(piece);
-        const pieceKey = `${pc === 'w' ? 'w' : 'b'}${pt}`;
-        const pieceIdx = this.pieceMap[pieceKey];
-        if (pieceIdx === undefined) continue;
-        
-        const square = r * 8 + c;
-        const featureIdx = pieceIdx * 64 + square;
-        features[featureIdx] = 1.0;
-      }
-    }
-    
-    // SPEED FEATURES (768-783) - YOUR Python trainer EXACTLY
-    features[768] = isInCheck(state) ? 1.0 : 0.0;                    // Check bonus
-    features[769] = Math.min(moveNumber / 40.0, 1.0);                // Time penalty
-    features[770] = state.turn === 'w' ? 1.0 : 0.0;                  // Turn indicator
-    
-    // King distance to center (d4/e4/d5/e5 = square 27-35)
-    const wKing = this.findKing(state, 'w');
-    const bKing = this.findKing(state, 'b');
-    if (wKing !== null) {
-      const dist = Math.min(Math.abs(wKing[0] - 3.5) + Math.abs(wKing[1] - 3.5), 4) / 4.0;
-      features[771] = dist;
-    }
-    if (bKing !== null) {
-      const dist = Math.min(Math.abs(bKing[0] - 3.5) + Math.abs(bKing[1] - 3.5), 4) / 4.0;
-      features[772] = dist;
-    }
-    
-    features[774] = Math.min(getAllLegalMoves(state).length / 30.0, 1.0); // Mobility
-    
-    // NNUE forward pass
-    for (let i = 0; i < 256; i++) {
-      this.accumulator[i] = this.weights.fc1_bias[i];
-      for (let j = 0; j < 784; j++) {
-        this.accumulator[i] += features[j] * this.weights.fc1_weight[i][j];
-      }
-    }
-    
-    return features;
-  }
+    const features = new Float32Array(this.inputSize);
 
-  private findKing(state: GameState, color: string): [number, number] | null {
-    for (let r = 0; r < 8; r++) {
-      for (let c = 0; c < 8; c++) {
-        const piece = state.board[r][c];
-        if (piece && pieceColor(piece) === color && pieceType(piece) === 'K') {
-          return [r, c];
+    // 1) Piece features: 12 * 64 = 768 (if inputSize >= 768)
+    const pieceFeatureCount = Math.min(768, this.inputSize);
+    if (pieceFeatureCount === 768) {
+      for (let r = 0; r < 8; r++) {
+        for (let c = 0; c < 8; c++) {
+          const p = state.board[r][c];
+          if (!p) continue;
+          const col = pieceColor(p);
+          const pt = pieceType(p);
+          const key = `${col}${pt}` as keyof typeof this.pieceMap;
+          const base = this.pieceMap[key];
+          if (base === undefined) continue;
+          const sq = r * 8 + c;
+          const idx = base * 64 + sq;
+          if (idx >= 0 && idx < pieceFeatureCount) {
+            features[idx] = 1.0;
+          }
         }
       }
     }
-    return null;
+
+    // 2) Extra features if the network expects >768 inputs (e.g. 784).
+    if (this.inputSize > 768) {
+      const idxCheck = 768;
+      const idxPly = 769;
+      const idxTurn = 770;
+      const idxWKingDist = 771;
+      const idxBKingDist = 772;
+      const idxMobility = 773;
+
+      // Check flag
+      if (idxCheck < this.inputSize) {
+        features[idxCheck] = isInCheck(state) ? 1.0 : 0.0;
+      }
+
+      // Normalized ply (0..1 roughly over first ~80 plies)
+      if (idxPly < this.inputSize) {
+        const normPly = Math.min(ply / 80, 1.0);
+        features[idxPly] = normPly;
+      }
+
+      // Turn indicator
+      if (idxTurn < this.inputSize) {
+        features[idxTurn] = state.turn === 'w' ? 1.0 : 0.0;
+      }
+
+      // King distance to center
+      const centerR = 3.5;
+      const centerC = 3.5;
+      let wKingR = -1,
+        wKingC = -1,
+        bKingR = -1,
+        bKingC = -1;
+      for (let r = 0; r < 8; r++) {
+        for (let c = 0; c < 8; c++) {
+          const p = state.board[r][c];
+          if (!p) continue;
+          if (pieceType(p) === 'K') {
+            if (pieceColor(p) === 'w') {
+              wKingR = r;
+              wKingC = c;
+            } else {
+              bKingR = r;
+              bKingC = c;
+            }
+          }
+        }
+      }
+      if (idxWKingDist < this.inputSize && wKingR !== -1) {
+        const dr = wKingR - centerR;
+        const dc = wKingC - centerC;
+        features[idxWKingDist] = Math.min(Math.sqrt(dr * dr + dc * dc) / 4.0, 1.0);
+      }
+      if (idxBKingDist < this.inputSize && bKingR !== -1) {
+        const dr = bKingR - centerR;
+        const dc = bKingC - centerC;
+        features[idxBKingDist] = Math.min(Math.sqrt(dr * dr + dc * dc) / 4.0, 1.0);
+      }
+
+      // Mobility
+      if (idxMobility < this.inputSize) {
+        const moves = getAllLegalMoves(state);
+        features[idxMobility] = Math.min(moves.length / 30.0, 1.0);
+      }
+    }
+
+    // Run first NNUE layer: acc = ReLU_clipped(fc1(features))
+    const { fc1_weight, fc1_bias } = this.weights;
+    for (let i = 0; i < 256; i++) {
+      let sum = fc1_bias[i];
+      const row = fc1_weight[i];
+      for (let j = 0; j < this.inputSize; j++) {
+        sum += row[j] * features[j];
+      }
+      // Clipped ReLU 0..1
+      if (sum < 0) sum = 0;
+      else if (sum > 1) sum = 1;
+      this.accumulator[i] = sum;
+    }
+
+    return features;
   }
 
   public evaluate(): number {
     if (!this.weights) return 0;
-    
-    // Clipped ReLU → Value head (EXACTLY your Python trainer)
-    let output = this.weights.fc2_bias;
+    const { fc2_weight, fc2_bias } = this.weights;
+    let out = fc2_bias;
     for (let i = 0; i < 256; i++) {
-      const hidden = Math.max(0, Math.min(1, this.accumulator[i]));
-      output += hidden * this.weights.fc2_weight[i];
+      out += this.accumulator[i] * fc2_weight[i];
     }
-    return output * 100; // Centipawns
-  }
-
-  public getPolicy(): Float32Array {
-    if (!this.weights) return new Float32Array(24);
-    
-    // Policy head - YOUR 24-move softmax targets
-    const policy = new Float32Array(24);
-    for (let i = 0; i < 24; i++) {
-      policy[i] = this.weights.policy_bias[i];
-      for (let j = 0; j < 256; j++) {
-        const hidden = Math.max(0, Math.min(1, this.accumulator[j]));
-        policy[i] += hidden * this.weights.policy_weight[i * 256 + j];
-      }
-    }
-    
-    // Softmax (your Python trainer format)
-    const maxLogit = Math.max(...Array.from(policy));
-    let sum = 0;
-    for (let i = 0; i < 24; i++) {
-      policy[i] = Math.exp(policy[i] - maxLogit);
-      sum += policy[i];
-    }
-    for (let i = 0; i < 24; i++) {
-      policy[i] /= sum;
-    }
-    
-    return policy;
+    // Assumed to be value from side to move, in pawns; scale to centipawns
+    return out * 100;
   }
 }
 
-const evaluator = new FixedNNUEEvaluator();
+const evaluator = new NNUEEvaluator();
 
-// ─── Zobrist + TT (unchanged) ─────────────────────────────────────────────────
+// ─── Zobrist Hashing & Transposition Table ────────────────────────────────────
 
 const ZOBRIST_PIECES = new Uint32Array(12 * 64);
 const ZOBRIST_SIDE = BigInt('0x123456789ABCDEF0');
@@ -220,13 +271,12 @@ function computeZobrist(state: GameState): bigint {
   for (let r = 0; r < 8; r++) {
     for (let c = 0; c < 8; c++) {
       const p = state.board[r][c];
-      if (p) {
-        const pt = pieceType(p);
-        const pc = pieceColor(p);
-        const pieceIdx = (pc === 'w' ? 0 : 6) + 'PNBRQK'.indexOf(pt);
-        const sq = r * 8 + c;
-        hash ^= BigInt(ZOBRIST_PIECES[pieceIdx * 64 + sq]);
-      }
+      if (!p) continue;
+      const pt = pieceType(p);
+      const pc = pieceColor(p);
+      const pieceIdx = (pc === 'w' ? 0 : 6) + 'PNBRQK'.indexOf(pt);
+      const sq = r * 8 + c;
+      hash ^= BigInt(ZOBRIST_PIECES[pieceIdx * 64 + sq]);
     }
   }
   if (state.turn === 'b') hash ^= ZOBRIST_SIDE;
@@ -236,9 +286,8 @@ function computeZobrist(state: GameState): bigint {
 interface TTEntry {
   depth: number;
   score: number;
-  flag: 0 | 1 | 2;
+  flag: 0 | 1 | 2; // 0 = exact, 1 = lower bound, 2 = upper bound
   move?: Move;
-  policy?: Float32Array;
 }
 
 const TT_SIZE = 1 << 20;
@@ -248,9 +297,16 @@ function getTTMove(hash: bigint): Move | undefined {
   return TT.get(hash)?.move;
 }
 
-function storeTT(hash: bigint, depth: number, score: number, flag: 0 | 1 | 2, move?: Move, policy?: Float32Array) {
-  if (!TT.has(hash) || depth >= (TT.get(hash)?.depth ?? 0)) {
-    TT.set(hash, { depth, score, flag, move, policy });
+function storeTT(
+  hash: bigint,
+  depth: number,
+  score: number,
+  flag: 0 | 1 | 2,
+  move?: Move,
+) {
+  const existing = TT.get(hash);
+  if (!existing || depth >= existing.depth) {
+    TT.set(hash, { depth, score, flag, move });
     if (TT.size > TT_SIZE) {
       const firstKey = TT.keys().next().value;
       TT.delete(firstKey);
@@ -258,126 +314,144 @@ function storeTT(hash: bigint, depth: number, score: number, flag: 0 | 1 | 2, mo
   }
 }
 
-// ─── FIXED Move Ordering w/ Policy Head ───────────────────────────────────────
+// ─── Evaluation wrapper ───────────────────────────────────────────────────────
 
-function getMoveIndex(move: Move): number {
-  // Simplified 24-move indexing matching your Python trainer
-  const fromSq = move.from[0] * 8 + move.from[1];
-  const toSq = move.to[0] * 8 + move.to[1];
-  return Math.min((fromSq * 8 + toSq) % 24, 23);
+export function evaluate(state: GameState, ply: number): number {
+  const result = getGameResult(state);
+  if (result === 'checkmate') {
+    return state.turn === 'w' ? -99999 : 99999;
+  }
+  if (result === 'stalemate' || result === 'draw-50') {
+    return 0;
+  }
+
+  evaluator.setPosition(state, ply);
+  const nnueScore = evaluator.evaluate();
+
+  return nnueScore;
 }
 
-function scoreMoveForOrdering(state: GameState, move: Move, ttMove?: Move, policy?: Float32Array): number {
+// ─── Move ordering helpers ────────────────────────────────────────────────────
+
+function areMovesEqual(a: Move | undefined, b: Move | undefined): boolean {
+  if (!a || !b) return false;
+  return (
+    a.from.r === b.from.r &&
+    a.from.c === b.from.c &&
+    a.to.r === b.to.r &&
+    a.to.c === b.to.c &&
+    a.promotion === b.promotion
+  );
+}
+
+function scoreMoveForOrdering(
+  state: GameState,
+  move: Move,
+  ttMove?: Move,
+): number {
+  // TT move first
+  if (ttMove && areMovesEqual(move, ttMove)) return 1_000_000;
+
   let score = 0;
-  
-  // 1. TT HIT (highest priority)
-  if (ttMove && areMovesEqual(move, ttMove)) return 1000000;
-  
-  // 2. TRAINED POLICY (10x weight over classical)
-  if (policy) {
-    score += policy[getMoveIndex(move)] * 100000; // YOUR training data!
-  }
-  
-  // 3. Check moves
-  if (isInCheck(applyMove(state, move))) score += 50000;
-  
-  // 4. MVV-LVA (fallback)
+
+  // Check moves
+  const next = applyMove(state, move);
+  if (isInCheck(next)) score += 50_000;
+
+  // Captures (MVV-LVA style)
   if (move.captured) {
-    const attacker = PIECE_VALUE[move.piece?.[1] ?? 'P'] ?? 0;
+    const attacker = PIECE_VALUE[move.piece[1]] ?? 0;
     const victim = PIECE_VALUE[move.captured[1]] ?? 0;
-    score += 10000 + (victim * 10 - attacker);
+    score += 10_000 + (victim * 10 - attacker);
   }
-  
-  // 5. Promotions
-  if (move.promotion) score += 20000 + PIECE_VALUE[move.promotion ?? 'Q'];
-  
+
+  // Promotions
+  if (move.promotion) {
+    score += 20_000 + (PIECE_VALUE[move.promotion] ?? 0);
+  }
+
   return score;
 }
 
-function areMovesEqual(a: Move, b: Move): boolean {
-  return a.from.r === b.from.r && a.from.c === b.from.c &&
-         a.to.r === b.to.r && a.to.c === b.to.c &&
-         a.promotion === b.promotion;
-}
-
-function orderMoves(state: GameState, moves: Move[], ttMove?: Move, policy?: Float32Array): Move[] {
-  return [...moves].sort((a, b) => 
-    scoreMoveForOrdering(state, b, ttMove, policy) - 
-    scoreMoveForOrdering(state, a, ttMove, policy)
+function orderMoves(state: GameState, moves: Move[], ttMove?: Move): Move[] {
+  return [...moves].sort(
+    (a, b) =>
+      scoreMoveForOrdering(state, b, ttMove) -
+      scoreMoveForOrdering(state, a, ttMove),
   );
 }
 
-// ─── FIXED Evaluation (uses ALL training data) ────────────────────────────────
-
-let globalMoveNumber = 0;
-
-export function evaluate(state: GameState): number {
-  const result = getGameResult(state);
-  if (result === 'checkmate') return state.turn === 'w' ? -99999 : 99999;
-  if (result === 'stalemate' || result === 'draw-50') return 0;
-
-  evaluator.setPosition(state, globalMoveNumber);
-  return evaluator.evaluate();
-}
-
-// ─── Quiescence + Negamax (enhanced w/ policy) ────────────────────────────────
+// ─── Quiescence search ────────────────────────────────────────────────────────
 
 let nodesSearched = 0;
 
-function quiescence(state: GameState, alpha: number, beta: number, moveNumber: number): number {
-  const stand_pat = evaluate(state);
-  if (stand_pat >= beta) return beta;
-  if (stand_pat > alpha) alpha = stand_pat;
+function quiescence(
+  state: GameState,
+  alpha: number,
+  beta: number,
+  ply: number,
+): number {
+  const standPat = evaluate(state, ply);
+  if (standPat >= beta) return beta;
+  if (standPat > alpha) alpha = standPat;
 
-  const forcingMoves = getAllLegalMoves(state).filter(m => 
-    m.captured || isInCheck(applyMove(state, m))
-  );
-  
-  evaluator.setPosition(state, moveNumber);
-  const policy = evaluator.getPolicy();
-  
-  for (const move of orderMoves(state, forcingMoves, undefined, policy)) {
+  const forcingMoves = getAllLegalMoves(state).filter((m) => {
+    const capture = !!m.captured;
+    const givesCheck = isInCheck(applyMove(state, m));
+    return capture || givesCheck;
+  });
+
+  if (forcingMoves.length === 0) return alpha;
+
+  const ordered = orderMoves(state, forcingMoves);
+  for (const move of ordered) {
     const next = applyMove(state, move);
-    const score = -quiescence(next, -beta, -alpha, moveNumber + 1);
+    const score = -quiescence(next, -beta, -alpha, ply + 1);
     if (score >= beta) return beta;
     if (score > alpha) alpha = score;
   }
+
   return alpha;
 }
 
-function negamax(state: GameState, depth: number, alpha: number, beta: number, moveNumber: number): number {
+// ─── Negamax with alpha–beta ──────────────────────────────────────────────────
+
+function negamax(
+  state: GameState,
+  depth: number,
+  alpha: number,
+  beta: number,
+  ply: number,
+): number {
   nodesSearched++;
-  globalMoveNumber = moveNumber;
-  
+
   const hash = computeZobrist(state);
   const ttEntry = TT.get(hash);
-  
   if (ttEntry && ttEntry.depth >= depth) {
     if (ttEntry.flag === 0) return ttEntry.score;
     if (ttEntry.flag === 1 && ttEntry.score >= beta) return ttEntry.score;
     if (ttEntry.flag === 2 && ttEntry.score <= alpha) return ttEntry.score;
   }
-  
+  const ttMove = ttEntry?.move;
+
   const result = getGameResult(state);
   if (result !== 'ongoing') {
-    if (result === 'checkmate') return state.turn === 'w' ? -99999 : 99999;
+    if (result === 'checkmate') return -99999;
     return 0;
   }
-  
-  if (depth === 0) return quiescence(state, alpha, beta, moveNumber);
-  
-  evaluator.setPosition(state, moveNumber);
-  const policy = evaluator.getPolicy();
-  const ttMove = ttEntry?.move;
-  
+
+  if (depth === 0) {
+    return quiescence(state, alpha, beta, ply);
+  }
+
   let bestScore = -Infinity;
-  let bestMove: Move | undefined = undefined;
-  
-  const moves = orderMoves(state, getAllLegalMoves(state), ttMove, policy);
+  let bestMove: Move | undefined;
+
+  const moves = orderMoves(state, getAllLegalMoves(state), ttMove);
   for (const move of moves) {
     const next = applyMove(state, move);
-    const score = -negamax(next, depth - 1, -beta, -alpha, moveNumber + 1);
-    
+    const score = -negamax(next, depth - 1, -beta, -alpha, ply + 1);
+
     if (score > bestScore) {
       bestScore = score;
       bestMove = move;
@@ -385,90 +459,113 @@ function negamax(state: GameState, depth: number, alpha: number, beta: number, m
     if (bestScore > alpha) alpha = bestScore;
     if (alpha >= beta) break;
   }
-  
-  let flag = 0;
-  if (bestScore <= alpha) flag = 2;
-  else if (bestScore >= beta) flag = 1;
-  
-  storeTT(hash, depth, bestScore, flag, bestMove, policy);
+
+  let flag: 0 | 1 | 2 = 0;
+  if (bestScore <= alpha) flag = 2; // upper bound
+  else if (bestScore >= beta) flag = 1; // lower bound
+
+  storeTT(hash, depth, bestScore, flag, bestMove);
+
   return bestScore;
 }
 
-// ─── FIXED Public API ─────────────────────────────────────────────────────────
+// ─── Public API ───────────────────────────────────────────────────────────────
 
 export interface AIResult {
   move: Move;
   score: number;
   depth: number;
   nodes: number;
-  policyUsed: boolean;
 }
 
-export async function getBestMove(state: GameState, timeLimitMs = 1500): Promise<AIResult> {
-  return new Promise(resolve => {
+export async function getBestMove(
+  state: GameState,
+  timeLimitMs = 1500,
+): Promise<AIResult> {
+  return new Promise((resolve) => {
     setTimeout(() => {
       const start = Date.now();
       nodesSearched = 0;
       TT.clear();
-      
+
       const moves = getAllLegalMoves(state);
-      if (moves.length === 0) throw new Error('No legal moves');
+      if (moves.length === 0) {
+        throw new Error('No legal moves');
+      }
       if (moves.length === 1) {
-        resolve({ move: moves[0], score: 0, depth: 0, nodes: 1, policyUsed: false });
+        resolve({
+          move: moves[0],
+          score: 0,
+          depth: 0,
+          nodes: 1,
+        });
         return;
       }
-      
+
+      // Increment a global ply counter each AI turn to feed into NNUE extras
+      GAME_MOVE_NUMBER++;
+
       let bestMove = moves[0];
       let bestScore = -Infinity;
       let completedDepth = 0;
-      
-      for (let depth = 1; depth <= 12; depth++) { // Deeper search
+
+      // Iterative deepening
+      for (let depth = 1; depth <= 8; depth++) {
         if (Date.now() - start > timeLimitMs) break;
-        
+
         let depthBestMove = moves[0];
         let depthBestScore = -Infinity;
         let alpha = -Infinity;
         let beta = Infinity;
-        
+
         const hash = computeZobrist(state);
         const ttMove = getTTMove(hash);
-        
-        const ordered = orderMoves(state, moves, ttMove, evaluator.getPolicy());
-        
+        const ordered = orderMoves(state, moves, ttMove);
+
         for (const move of ordered) {
           if (Date.now() - start > timeLimitMs) break;
-          
+
           const next = applyMove(state, move);
-          const score = -negamax(next, depth - 1, -beta, -alpha, 0);
-          
+          const score = -negamax(
+            next,
+            depth - 1,
+            -beta,
+            -alpha,
+            GAME_MOVE_NUMBER + 1,
+          );
+
           if (score > depthBestScore) {
             depthBestScore = score;
             depthBestMove = move;
           }
           if (score > alpha) alpha = score;
         }
-        
+
         if (depthBestMove) {
           bestMove = depthBestMove;
           bestScore = depthBestScore;
           completedDepth = depth;
         }
       }
-      
-      resolve({ 
-        move: bestMove, 
-        score: bestScore, 
-        depth: completedDepth, 
+
+      resolve({
+        move: bestMove,
+        score: bestScore,
+        depth: completedDepth,
         nodes: nodesSearched,
-        policyUsed: true 
       });
     }, 10);
   });
 }
 
-export async function initAI(modelUrl: string = '/🏆_FASTEST_CHECKMATE.nnue'): Promise<void> {
-  await evaluator.loadWeights(modelUrl);
-  console.log('✅ FIXED AI: Full 784-feature + Policy Head active!');
-}
+// Initialize NNUE from your trained .nnue in /public
+let initialized = false;
 
-// ─── React Hook (unchanged) ───────────────────────────────────────────────────
+export async function initAI(
+  modelUrl: string = '/best_network.nnue',
+): Promise<void> {
+  if (initialized) return;
+  await evaluator.loadWeights(modelUrl);
+  initialized = true;
+  console.log('AI initialized with trained NNUE model');
+}
