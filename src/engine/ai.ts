@@ -18,11 +18,11 @@ const PIECE_VALUE: Record<string, number> = {
   B: 330,
   R: 500,
   Q: 900,
-  K: 0,
+  K: 20000,
 };
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Repetition / anti-shuffle tracking
+// History
 // ──────────────────────────────────────────────────────────────────────────────
 
 type HistoryState = {
@@ -41,6 +41,19 @@ function cloneHistory(h: HistoryState): HistoryState {
   };
 }
 
+function sqEq(a: { r: number; c: number }, b: { r: number; c: number }): boolean {
+  return a.r === b.r && a.c === b.c;
+}
+
+function sameMove(a?: Move, b?: Move): boolean {
+  if (!a || !b) return false;
+  return (
+    sqEq(a.from, b.from) &&
+    sqEq(a.to, b.to) &&
+    a.promotion === b.promotion
+  );
+}
+
 function boardKey(state: GameState): string {
   const rows: string[] = [];
   for (let r = 0; r < 8; r++) {
@@ -53,24 +66,11 @@ function boardKey(state: GameState): string {
   return `${rows.join('/')}_${state.turn}`;
 }
 
-function sameSquare(a: { r: number; c: number }, b: { r: number; c: number }): boolean {
-  return a.r === b.r && a.c === b.c;
-}
-
-function sameMove(a?: Move, b?: Move): boolean {
-  if (!a || !b) return false;
-  return (
-    sameSquare(a.from, b.from) &&
-    sameSquare(a.to, b.to) &&
-    a.promotion === b.promotion
-  );
-}
-
 function isReverseMove(current: Move, prev?: Move): boolean {
   if (!prev) return false;
   return (
-    sameSquare(current.from, prev.to) &&
-    sameSquare(current.to, prev.from) &&
+    sqEq(current.from, prev.to) &&
+    sqEq(current.to, prev.from) &&
     current.piece === prev.piece
   );
 }
@@ -83,11 +83,10 @@ function isRookShuffle(move: Move, prev?: Move): boolean {
 }
 
 function updatesNoProgress(move: Move, prevNoProgress: number): number {
-  const isPawnMove = move.piece ? pieceType(move.piece) === 'P' : false;
-  const isCapture = !!move.captured;
-  const isPromotion = !!move.promotion;
-
-  if (isPawnMove || isCapture || isPromotion) return 0;
+  const pawnMove = move.piece ? pieceType(move.piece) === 'P' : false;
+  const capture = !!move.captured;
+  const promotion = !!move.promotion;
+  if (pawnMove || capture || promotion) return 0;
   return prevNoProgress + 1;
 }
 
@@ -108,9 +107,9 @@ function pushHistory(history: HistoryState, stateAfterMove: GameState, move: Mov
 // ──────────────────────────────────────────────────────────────────────────────
 
 interface NNUEWeights {
-  fc1_weight: Float32Array[]; // [256][inputSize]
-  fc1_bias: Float32Array;     // [256]
-  fc2_weight: Float32Array;   // [256]
+  fc1_weight: Float32Array[];
+  fc1_bias: Float32Array;
+  fc2_weight: Float32Array;
   fc2_bias: number;
 }
 
@@ -120,18 +119,8 @@ class NNUEEvaluator {
   private inputSize = 768;
 
   private pieceMap: Record<string, number> = {
-    wP: 0,
-    wN: 1,
-    wB: 2,
-    wR: 3,
-    wQ: 4,
-    wK: 5,
-    bP: 6,
-    bN: 7,
-    bB: 8,
-    bR: 9,
-    bQ: 10,
-    bK: 11,
+    wP: 0, wN: 1, wB: 2, wR: 3, wQ: 4, wK: 5,
+    bP: 6, bN: 7, bB: 8, bR: 9, bQ: 10, bK: 11,
   };
 
   public async loadWeights(url: string): Promise<void> {
@@ -200,7 +189,6 @@ class NNUEEvaluator {
 
     const features = new Float32Array(this.inputSize);
 
-    // Base 768 piece-square features
     for (let r = 0; r < 8; r++) {
       for (let c = 0; c < 8; c++) {
         const p = state.board[r][c];
@@ -216,13 +204,11 @@ class NNUEEvaluator {
       }
     }
 
-    // Extra features if model supports >768
     if (this.inputSize > 768) {
       if (768 < this.inputSize) features[768] = isInCheck(state) ? 1 : 0;
       if (769 < this.inputSize) features[769] = Math.min(ply / 80, 1.0);
       if (770 < this.inputSize) features[770] = state.turn === 'w' ? 1 : 0;
 
-      // king distance to center
       let wKr = -1, wKc = -1, bKr = -1, bKc = -1;
       for (let r = 0; r < 8; r++) {
         for (let c = 0; c < 8; c++) {
@@ -235,6 +221,7 @@ class NNUEEvaluator {
           }
         }
       }
+
       const centerR = 3.5;
       const centerC = 3.5;
       if (771 < this.inputSize && wKr !== -1) {
@@ -250,8 +237,6 @@ class NNUEEvaluator {
       if (773 < this.inputSize) {
         features[773] = Math.min(getAllLegalMoves(state).length / 30.0, 1.0);
       }
-
-      // Optional history-aware extras if your net has room
       if (774 < this.inputSize) {
         const key = boardKey(state);
         const reps = history.fenKeys.filter((k) => k === key).length;
@@ -288,7 +273,7 @@ class NNUEEvaluator {
 const evaluator = new NNUEEvaluator();
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Zobrist hashing / TT
+// Zobrist / TT
 // ──────────────────────────────────────────────────────────────────────────────
 
 const ZOBRIST_PIECES = new Uint32Array(12 * 64);
@@ -344,7 +329,111 @@ function storeTT(hash: bigint, depth: number, score: number, flag: 0 | 1 | 2, mo
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Anti-shuffle penalties
+// Attack / hanging piece helpers
+// ──────────────────────────────────────────────────────────────────────────────
+
+function findMovedPieceOnBoard(state: GameState, move: Move): string | null {
+  const piece = state.board[move.to.r]?.[move.to.c] ?? null;
+  if (!piece) return null;
+  return piece;
+}
+
+function getAttackingMoves(state: GameState, target: { r: number; c: number }): Move[] {
+  const legal = getAllLegalMoves(state);
+  return legal.filter((m) => m.to.r === target.r && m.to.c === target.c);
+}
+
+function getCheapestAttackerValue(state: GameState, target: { r: number; c: number }): number | null {
+  const attacks = getAttackingMoves(state, target);
+  if (attacks.length === 0) return null;
+
+  let best = Infinity;
+  for (const m of attacks) {
+    const p = m.piece;
+    if (!p) continue;
+    const val = PIECE_VALUE[pieceType(p)] ?? 1000;
+    if (val < best) best = val;
+  }
+  return best === Infinity ? null : best;
+}
+
+function squareDefenderCount(state: GameState, target: { r: number; c: number }): number {
+  return getAttackingMoves(state, target).length;
+}
+
+function hangingPenalty(
+  prevState: GameState,
+  nextState: GameState,
+  move: Move,
+): number {
+  const movedPiece = findMovedPieceOnBoard(nextState, move);
+  if (!movedPiece) return 0;
+
+  const movedType = pieceType(movedPiece);
+  const movedValue = PIECE_VALUE[movedType] ?? 0;
+  if (movedType === 'K') return 0;
+
+  // Opponent to move in nextState
+  const oppAttacks = getAttackingMoves(nextState, move.to);
+  if (oppAttacks.length === 0) return 0;
+
+  const cheapestAttacker = getCheapestAttackerValue(nextState, move.to) ?? 0;
+
+  // Count our defenders by flipping turn back temporarily
+  const sameSideState: GameState = {
+    ...nextState,
+    turn: prevState.turn,
+  };
+  const defenders = squareDefenderCount(sameSideState, move.to);
+  const attackers = oppAttacks.length;
+
+  let penalty = 0;
+
+  // Pure hanging piece
+  if (defenders === 0) {
+    penalty += Math.floor(movedValue * 0.85);
+  }
+
+  // Bad trade warning
+  if (cheapestAttacker < movedValue) {
+    penalty += Math.floor((movedValue - cheapestAttacker) * 0.7);
+  }
+
+  // Outnumbered on destination square
+  if (attackers > defenders) {
+    penalty += Math.min((attackers - defenders) * 60, 180);
+  }
+
+  // Extra queen-safety punishment
+  if (movedType === 'Q') {
+    penalty = Math.floor(penalty * 1.5);
+  }
+
+  return penalty;
+}
+
+function suicidalCheckPenalty(prevState: GameState, nextState: GameState, move: Move): number {
+  const givesCheck = isInCheck(nextState);
+  if (!givesCheck) return 0;
+
+  const movedPiece = findMovedPieceOnBoard(nextState, move);
+  if (!movedPiece) return 0;
+
+  const movedType = pieceType(movedPiece);
+  const movedValue = PIECE_VALUE[movedType] ?? 0;
+
+  const oppAttacks = getAttackingMoves(nextState, move.to);
+  if (oppAttacks.length === 0) return 0;
+
+  const cheapestAttacker = getCheapestAttackerValue(nextState, move.to) ?? movedValue;
+  if (cheapestAttacker < movedValue) {
+    return Math.floor((movedValue - cheapestAttacker) * 0.9);
+  }
+  return 0;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Anti-shuffle / progress
 // ──────────────────────────────────────────────────────────────────────────────
 
 function antiShufflePenalty(state: GameState, history: HistoryState, lastMove?: Move): number {
@@ -353,7 +442,6 @@ function antiShufflePenalty(state: GameState, history: HistoryState, lastMove?: 
   const key = boardKey(state);
   const reps = history.fenKeys.filter((k) => k === key).length;
 
-  // repeated position
   if (reps >= 1) penalty += 35;
   if (reps >= 2) penalty += 80;
   if (reps >= 3) penalty += 200;
@@ -363,16 +451,10 @@ function antiShufflePenalty(state: GameState, history: HistoryState, lastMove?: 
   const prev3 = history.moves[history.moves.length - 3];
 
   if (lastMove) {
-    // exact bounce back
     if (isReverseMove(lastMove, prev)) penalty += 120;
-
-    // rook bounce is extra bad
     if (isRookShuffle(lastMove, prev)) penalty += 180;
-
-    // 2-ply loop pattern
     if (prev2 && isReverseMove(lastMove, prev2)) penalty += 60;
 
-    // same piece moving again and again without progress
     if (
       prev &&
       lastMove.piece &&
@@ -395,9 +477,7 @@ function antiShufflePenalty(state: GameState, history: HistoryState, lastMove?: 
     }
   }
 
-  // no progress
   penalty += Math.min(history.noProgressPly * 4, 120);
-
   return penalty;
 }
 
@@ -419,28 +499,33 @@ function evalWithContext(
   ply: number,
   history: HistoryState,
   lastMove?: Move,
+  prevState?: GameState,
 ): number {
   const result = getGameResult(state);
 
-  if (result === 'checkmate') {
-    // side to move is mated
-    return -99999 + ply;
-  }
-  if (result === 'stalemate' || result === 'draw-50') {
-    return 0;
-  }
+  if (result === 'checkmate') return -99999 + ply;
+  if (result === 'stalemate' || result === 'draw-50') return 0;
 
   evaluator.setPosition(state, ply, history);
+
   let score = evaluator.evaluate();
-
   score -= antiShufflePenalty(state, history, lastMove);
-  score += progressBonus(lastMove, state);
 
+  if (lastMove && prevState) {
+    score -= hangingPenalty(prevState, state, lastMove);
+    score -= suicidalCheckPenalty(prevState, state, lastMove);
+  }
+
+  score += progressBonus(lastMove, state);
   return score;
 }
 
 export function evaluate(state: GameState): number {
-  const history: HistoryState = { fenKeys: [boardKey(state)], moves: [], noProgressPly: 0 };
+  const history: HistoryState = {
+    fenKeys: [boardKey(state)],
+    moves: [],
+    noProgressPly: 0,
+  };
   return evalWithContext(state, 0, history);
 }
 
@@ -459,7 +544,12 @@ function areMovesEqual(a?: Move, b?: Move): boolean {
   );
 }
 
-function scoreMoveForOrdering(state: GameState, move: Move, ttMove?: Move): number {
+function scoreMoveForOrdering(
+  state: GameState,
+  move: Move,
+  ttMove?: Move,
+  history?: HistoryState,
+): number {
   if (ttMove && areMovesEqual(move, ttMove)) return 1_000_000;
 
   let score = 0;
@@ -468,8 +558,8 @@ function scoreMoveForOrdering(state: GameState, move: Move, ttMove?: Move): numb
   if (isInCheck(next)) score += 50_000;
 
   if (move.captured) {
-    const attacker = PIECE_VALUE[move.piece[1]] ?? 0;
-    const victim = PIECE_VALUE[move.captured[1]] ?? 0;
+    const attacker = PIECE_VALUE[pieceType(move.piece)] ?? 0;
+    const victim = PIECE_VALUE[pieceType(move.captured)] ?? 0;
     score += 10_000 + (victim * 10 - attacker);
   }
 
@@ -477,19 +567,32 @@ function scoreMoveForOrdering(state: GameState, move: Move, ttMove?: Move): numb
     score += 20_000 + (PIECE_VALUE[move.promotion] ?? 0);
   }
 
-  // discourage rook ping-pong in ordering too
   if (pieceType(move.piece) === 'R') {
     score -= 25;
+  }
+
+  // Immediate anti-blunder ordering
+  score -= hangingPenalty(state, next, move);
+  score -= suicidalCheckPenalty(state, next, move);
+
+  if (history) {
+    const nextHistory = pushHistory(history, next, move);
+    score -= antiShufflePenalty(next, nextHistory, move);
   }
 
   return score;
 }
 
-function orderMoves(state: GameState, moves: Move[], ttMove?: Move): Move[] {
+function orderMoves(
+  state: GameState,
+  moves: Move[],
+  ttMove?: Move,
+  history?: HistoryState,
+): Move[] {
   return [...moves].sort(
     (a, b) =>
-      scoreMoveForOrdering(state, b, ttMove) -
-      scoreMoveForOrdering(state, a, ttMove),
+      scoreMoveForOrdering(state, b, ttMove, history) -
+      scoreMoveForOrdering(state, a, ttMove, history),
   );
 }
 
@@ -506,8 +609,9 @@ function quiescence(
   ply: number,
   history: HistoryState,
   lastMove?: Move,
+  prevState?: GameState,
 ): number {
-  const standPat = evalWithContext(state, ply, history, lastMove);
+  const standPat = evalWithContext(state, ply, history, lastMove, prevState);
   if (standPat >= beta) return beta;
   if (standPat > alpha) alpha = standPat;
 
@@ -517,11 +621,11 @@ function quiescence(
 
   if (forcingMoves.length === 0) return alpha;
 
-  const ordered = orderMoves(state, forcingMoves);
+  const ordered = orderMoves(state, forcingMoves, undefined, history);
   for (const move of ordered) {
     const next = applyMove(state, move);
     const nextHistory = pushHistory(history, next, move);
-    const score = -quiescence(next, -beta, -alpha, ply + 1, nextHistory, move);
+    const score = -quiescence(next, -beta, -alpha, ply + 1, nextHistory, move, state);
 
     if (score >= beta) return beta;
     if (score > alpha) alpha = score;
@@ -538,6 +642,7 @@ function negamax(
   ply: number,
   history: HistoryState,
   lastMove?: Move,
+  prevState?: GameState,
 ): number {
   nodesSearched++;
 
@@ -557,11 +662,11 @@ function negamax(
   }
 
   if (depth === 0) {
-    return quiescence(state, alpha, beta, ply, history, lastMove);
+    return quiescence(state, alpha, beta, ply, history, lastMove, prevState);
   }
 
   const ttMove = ttEntry?.move;
-  const moves = orderMoves(state, getAllLegalMoves(state), ttMove);
+  const moves = orderMoves(state, getAllLegalMoves(state), ttMove, history);
 
   let bestScore = -Infinity;
   let bestMove: Move | undefined = undefined;
@@ -579,6 +684,7 @@ function negamax(
       ply + 1,
       nextHistory,
       move,
+      state,
     );
 
     if (score > bestScore) {
@@ -650,7 +756,7 @@ export async function getBestMove(
 
         const hash = computeZobrist(state);
         const ttMove = getTTMove(hash);
-        const ordered = orderMoves(state, moves, ttMove);
+        const ordered = orderMoves(state, moves, ttMove, rootHistory);
 
         for (const move of ordered) {
           if (Date.now() - start > timeLimitMs) break;
@@ -666,6 +772,7 @@ export async function getBestMove(
             1,
             nextHistory,
             move,
+            state,
           );
 
           if (score > depthBestScore) {
@@ -700,5 +807,5 @@ export async function initAI(modelUrl: string = '/best_network.nnue'): Promise<v
   if (initialized) return;
   await evaluator.loadWeights(modelUrl);
   initialized = true;
-  console.log('AI initialized with trained NNUE model + anti-shuffle penalties');
+  console.log('AI initialized with trained NNUE + anti-shuffle + anti-blunder penalties');
 }
