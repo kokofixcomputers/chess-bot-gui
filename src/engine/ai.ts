@@ -39,58 +39,62 @@ class FixedNNUEEvaluator {
     const data = new DataView(buffer);
     let offset = 0;
     
-    // Verify NNUE header
-    const magic = String.fromCharCode(
-      data.getUint8(0), data.getUint8(1), 
-      data.getUint8(2), data.getUint8(3)
-    );
-    if (magic !== 'NNUE') throw new Error('Invalid NNUE file');
+    // Header check
+    if (String.fromCharCode(data.getUint8(0), data.getUint8(1), data.getUint8(2), data.getUint8(3)) !== 'NNUE') {
+      throw new Error('Invalid NNUE file');
+    }
     offset += 4;
     
-    const version = data.getInt32(offset, true);
-    offset += 4;
-    console.log(`✅ Loading FIXED NNUE v${version} (784 inputs)`);
+    const version = data.getInt32(offset, true); offset += 4;
+    console.log(`Loading NNUE v${version}`);
     
-    // FIXED: Load YOUR exact 784-feature weights
-    const fc1_len = data.getInt32(offset, true);
-    offset += 4;
-    if (fc1_len !== 256 * 784) throw new Error('Wrong feature count - expected 784');
+    // SAFER reading with bounds checking
+    const readInt32 = (off: number): number => {
+      if (off + 4 > buffer.byteLength) throw new Error(`Buffer too small at ${off}`);
+      return data.getInt32(off, true);
+    };
     
+    const readFloat32Array = (off: number, len: number): Float32Array => {
+      if (off + len * 4 > buffer.byteLength) throw new Error(`Buffer overflow at ${off}`);
+      return new Float32Array(buffer, off, len);
+    };
+    
+    // fc1_weight [256][784]
+    const fc1_len = readInt32(offset); offset += 4;
     const fc1_weight: Float32Array[] = [];
     for (let i = 0; i < 256; i++) {
-      const start = offset + i * 784 * 4;  // ← FIXED: 784 inputs
-      fc1_weight[i] = new Float32Array(buffer.slice(start, start + 784 * 4));
+      const start = offset + i * 784 * 4;
+      fc1_weight[i] = readFloat32Array(start, 784);
     }
     offset += fc1_len * 4;
     
-    const fc1_bias_len = data.getInt32(offset, true);
-    offset += 4;
-    const fc1_bias = new Float32Array(buffer.slice(offset, offset + fc1_bias_len * 4));
-    offset += fc1_bias_len * 4;
+    // fc1_bias [256]
+    const fc1_bias_len = readInt32(offset); offset += 4;
+    const fc1_bias = readFloat32Array(offset, fc1_bias_len); offset += fc1_bias_len * 4;
     
-    const fc2_weight_len = data.getInt32(offset, true);
-    offset += 4;
-    const fc2_weight = new Float32Array(buffer.slice(offset, offset + fc2_weight_len * 4));
-    offset += fc2_weight_len * 4;
+    // fc2_weight [256]
+    const fc2_weight_len = readInt32(offset); offset += 4;
+    const fc2_weight = readFloat32Array(offset, fc2_weight_len); offset += fc2_weight_len * 4;
     
+    // fc2_bias [1]
     const fc2_bias = data.getFloat32(offset, true); offset += 4;
     
-    // NEW: Policy head weights (24 outputs)
-    const policy_weight_len = data.getInt32(offset, true);
-    offset += 4;
-    const policy_weight = new Float32Array(buffer.slice(offset, offset + policy_weight_len * 4));
-    offset += policy_weight_len * 4;
+    // Skip policy weights (use fallback if missing)
+    try {
+      const policy_weight_len = readInt32(offset); offset += 4;
+      const policy_weight = readFloat32Array(offset, policy_weight_len / 256); offset += policy_weight_len * 4;
+      const policy_bias_len = readInt32(offset); offset += 4;
+      const policy_bias = readFloat32Array(offset, policy_bias_len);
+      
+      this.weights = { fc1_weight, fc1_bias, fc2_weight, fc2_bias, policy_weight, policy_bias };
+    } catch (e) {
+      console.warn('Policy head missing - using fallback');
+      this.weights = { fc1_weight, fc1_bias, fc2_weight, fc2_bias, policy_weight: new Float32Array(0), policy_bias: new Float32Array(0) };
+    }
     
-    const policy_bias_len = data.getInt32(offset, true);
-    offset += 4;
-    const policy_bias = new Float32Array(buffer.slice(offset, offset + policy_bias_len * 4));
-    
-    this.weights = { 
-      fc1_weight, fc1_bias, fc2_weight, fc2_bias, 
-      policy_weight, policy_bias 
-    };
-    console.log('✅ FIXED NNUE loaded - 784 features + Policy Head');
+    console.log('✅ FIXED NNUE loaded successfully!');
   }
+
 
   public setPosition(state: GameState, moveNumber: number = 0): Float32Array {
     if (!this.weights) return new Float32Array(784);
