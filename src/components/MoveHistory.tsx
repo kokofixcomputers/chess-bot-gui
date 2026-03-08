@@ -26,9 +26,9 @@ function formatMove(entry: HistoryEntry, index: number): string {
 export const MoveHistory: React.FC<Props> = ({ history }) => {
   const endRef = useRef<HTMLDivElement>(null);
 
-  useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [history.length]);
+  //useEffect(() => {
+  //  endRef.current?.scrollIntoView({ behavior: 'smooth' });
+  //}, [history.length]);
 
   const pairs: Array<[HistoryEntry, HistoryEntry | null]> = [];
   for (let i = 0; i < history.length; i += 2) {
