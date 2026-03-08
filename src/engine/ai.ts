@@ -1,12 +1,3 @@
-/**
- * Chess AI Engine (fixed)
- * -----------------------
- * - Negamax + alpha-beta pruning
- * - Iterative deepening
- * - Zobrist hashing + transposition table
- * - NNUE evaluation using all available input features (768 or 784)
- */
-
 import type { GameState, Move } from './types';
 import {
   applyMove,
@@ -17,7 +8,9 @@ import {
   getGameResult,
 } from './chess';
 
-// ─── Piece values (for move ordering) ─────────────────────────────────────────
+// ──────────────────────────────────────────────────────────────────────────────
+// Piece values
+// ──────────────────────────────────────────────────────────────────────────────
 
 const PIECE_VALUE: Record<string, number> = {
   P: 100,
@@ -28,7 +21,91 @@ const PIECE_VALUE: Record<string, number> = {
   K: 0,
 };
 
-// ─── NNUE Evaluator ───────────────────────────────────────────────────────────
+// ──────────────────────────────────────────────────────────────────────────────
+// Repetition / anti-shuffle tracking
+// ──────────────────────────────────────────────────────────────────────────────
+
+type HistoryState = {
+  fenKeys: string[];
+  moves: Move[];
+  noProgressPly: number;
+};
+
+const MAX_HISTORY = 24;
+
+function cloneHistory(h: HistoryState): HistoryState {
+  return {
+    fenKeys: [...h.fenKeys],
+    moves: [...h.moves],
+    noProgressPly: h.noProgressPly,
+  };
+}
+
+function boardKey(state: GameState): string {
+  const rows: string[] = [];
+  for (let r = 0; r < 8; r++) {
+    let row = '';
+    for (let c = 0; c < 8; c++) {
+      row += state.board[r][c] ?? '.';
+    }
+    rows.push(row);
+  }
+  return `${rows.join('/')}_${state.turn}`;
+}
+
+function sameSquare(a: { r: number; c: number }, b: { r: number; c: number }): boolean {
+  return a.r === b.r && a.c === b.c;
+}
+
+function sameMove(a?: Move, b?: Move): boolean {
+  if (!a || !b) return false;
+  return (
+    sameSquare(a.from, b.from) &&
+    sameSquare(a.to, b.to) &&
+    a.promotion === b.promotion
+  );
+}
+
+function isReverseMove(current: Move, prev?: Move): boolean {
+  if (!prev) return false;
+  return (
+    sameSquare(current.from, prev.to) &&
+    sameSquare(current.to, prev.from) &&
+    current.piece === prev.piece
+  );
+}
+
+function isRookShuffle(move: Move, prev?: Move): boolean {
+  if (!prev) return false;
+  if (!move.piece || pieceType(move.piece) !== 'R') return false;
+  if (!prev.piece || pieceType(prev.piece) !== 'R') return false;
+  return isReverseMove(move, prev);
+}
+
+function updatesNoProgress(move: Move, prevNoProgress: number): number {
+  const isPawnMove = move.piece ? pieceType(move.piece) === 'P' : false;
+  const isCapture = !!move.captured;
+  const isPromotion = !!move.promotion;
+
+  if (isPawnMove || isCapture || isPromotion) return 0;
+  return prevNoProgress + 1;
+}
+
+function pushHistory(history: HistoryState, stateAfterMove: GameState, move: Move): HistoryState {
+  const next = cloneHistory(history);
+  next.moves.push(move);
+  if (next.moves.length > MAX_HISTORY) next.moves.shift();
+
+  next.fenKeys.push(boardKey(stateAfterMove));
+  if (next.fenKeys.length > MAX_HISTORY) next.fenKeys.shift();
+
+  next.noProgressPly = updatesNoProgress(move, next.noProgressPly);
+  return next;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// NNUE evaluator
+// ──────────────────────────────────────────────────────────────────────────────
 
 interface NNUEWeights {
   fc1_weight: Float32Array[]; // [256][inputSize]
@@ -40,7 +117,7 @@ interface NNUEWeights {
 class NNUEEvaluator {
   private weights: NNUEWeights | null = null;
   private accumulator: Float32Array = new Float32Array(256);
-  private inputSize = 768; // 12 * 64; will be updated from file
+  private inputSize = 768;
 
   private pieceMap: Record<string, number> = {
     wP: 0,
@@ -63,15 +140,12 @@ class NNUEEvaluator {
     const data = new DataView(buffer);
     let offset = 0;
 
-    // Magic "NNUE"
     const magic =
       String.fromCharCode(data.getUint8(0)) +
       String.fromCharCode(data.getUint8(1)) +
       String.fromCharCode(data.getUint8(2)) +
       String.fromCharCode(data.getUint8(3));
-    if (magic !== 'NNUE') {
-      throw new Error('Invalid NNUE file header');
-    }
+    if (magic !== 'NNUE') throw new Error('Invalid NNUE file header');
     offset += 4;
 
     const version = data.getInt32(offset, true);
@@ -83,45 +157,34 @@ class NNUEEvaluator {
       offset += 4;
       return v;
     };
+
     const readFloat32Array = (len: number) => {
       const arr = new Float32Array(buffer, offset, len);
       offset += len * 4;
       return arr;
     };
 
-    // fc1_weight: flattened [256 * inputSize]
-    const fc1_len = readInt32();
-    const inferredInputSize = fc1_len / 256;
+    const fc1Len = readInt32();
+    const inferredInputSize = fc1Len / 256;
     if (!Number.isInteger(inferredInputSize)) {
-      throw new Error(`fc1_len ${fc1_len} not divisible by 256`);
+      throw new Error(`fc1_len ${fc1Len} not divisible by 256`);
     }
     this.inputSize = inferredInputSize;
+
     const fc1_weight: Float32Array[] = [];
     for (let i = 0; i < 256; i++) {
-      const row = new Float32Array(
-        buffer,
-        offset + i * this.inputSize * 4,
-        this.inputSize,
+      fc1_weight.push(
+        new Float32Array(buffer, offset + i * this.inputSize * 4, this.inputSize)
       );
-      fc1_weight.push(row);
     }
-    offset += fc1_len * 4;
+    offset += fc1Len * 4;
 
-    // fc1_bias [256]
-    const fc1_bias_len = readInt32();
-    if (fc1_bias_len !== 256) {
-      console.warn(`Unexpected fc1_bias_len=${fc1_bias_len}, expected 256`);
-    }
-    const fc1_bias = readFloat32Array(fc1_bias_len);
+    const fc1BiasLen = readInt32();
+    const fc1_bias = readFloat32Array(fc1BiasLen);
 
-    // fc2_weight [256]
-    const fc2_weight_len = readInt32();
-    if (fc2_weight_len !== 256) {
-      console.warn(`Unexpected fc2_weight_len=${fc2_weight_len}, expected 256`);
-    }
-    const fc2_weight = readFloat32Array(fc2_weight_len);
+    const fc2WeightLen = readInt32();
+    const fc2_weight = readFloat32Array(fc2WeightLen);
 
-    // fc2_bias [1]
     const fc2_bias = data.getFloat32(offset, true);
     offset += 4;
 
@@ -129,10 +192,7 @@ class NNUEEvaluator {
     console.log(`NNUE weights loaded, inputSize=${this.inputSize}`);
   }
 
-  /**
-   * Build feature vector from board and ply, then run the first NNUE layer.
-   */
-  public setPosition(state: GameState, ply: number): void {
+  public setPosition(state: GameState, ply: number, history: HistoryState): void {
     if (!this.weights) {
       this.accumulator.fill(0);
       return;
@@ -140,100 +200,68 @@ class NNUEEvaluator {
 
     const features = new Float32Array(this.inputSize);
 
-    // 1) Piece features: 12 * 64 = 768 (if inputSize >= 768)
-    const pieceFeatureCount = Math.min(768, this.inputSize);
-    if (pieceFeatureCount === 768) {
-      for (let r = 0; r < 8; r++) {
-        for (let c = 0; c < 8; c++) {
-          const p = state.board[r][c];
-          if (!p) continue;
-          const col = pieceColor(p);
-          const pt = pieceType(p);
-          const key = `${col}${pt}` as keyof typeof this.pieceMap;
-          const base = this.pieceMap[key];
-          if (base === undefined) continue;
-          const sq = r * 8 + c;
-          const idx = base * 64 + sq;
-          if (idx >= 0 && idx < pieceFeatureCount) {
-            features[idx] = 1.0;
-          }
-        }
+    // Base 768 piece-square features
+    for (let r = 0; r < 8; r++) {
+      for (let c = 0; c < 8; c++) {
+        const p = state.board[r][c];
+        if (!p) continue;
+        const col = pieceColor(p);
+        const pt = pieceType(p);
+        const key = `${col}${pt}`;
+        const pieceIdx = this.pieceMap[key];
+        if (pieceIdx === undefined) continue;
+        const sq = r * 8 + c;
+        const idx = pieceIdx * 64 + sq;
+        if (idx < this.inputSize) features[idx] = 1.0;
       }
     }
 
-    // 2) Extra features if network expects >768 inputs (e.g. 784)
+    // Extra features if model supports >768
     if (this.inputSize > 768) {
-      const idxCheck = 768;
-      const idxPly = 769;
-      const idxTurn = 770;
-      const idxWKingDist = 771;
-      const idxBKingDist = 772;
-      const idxMobility = 773;
+      if (768 < this.inputSize) features[768] = isInCheck(state) ? 1 : 0;
+      if (769 < this.inputSize) features[769] = Math.min(ply / 80, 1.0);
+      if (770 < this.inputSize) features[770] = state.turn === 'w' ? 1 : 0;
 
-      // Check flag
-      if (idxCheck < this.inputSize) {
-        features[idxCheck] = isInCheck(state) ? 1.0 : 0.0;
+      // king distance to center
+      let wKr = -1, wKc = -1, bKr = -1, bKc = -1;
+      for (let r = 0; r < 8; r++) {
+        for (let c = 0; c < 8; c++) {
+          const p = state.board[r][c];
+          if (!p || pieceType(p) !== 'K') continue;
+          if (pieceColor(p) === 'w') {
+            wKr = r; wKc = c;
+          } else {
+            bKr = r; bKc = c;
+          }
+        }
       }
-
-      // Normalized ply (0..1)
-      if (idxPly < this.inputSize) {
-        features[idxPly] = Math.min(ply / 80, 1.0);
-      }
-
-      // Turn indicator
-      if (idxTurn < this.inputSize) {
-        features[idxTurn] = state.turn === 'w' ? 1.0 : 0.0;
-      }
-
-      // King distance to center
       const centerR = 3.5;
       const centerC = 3.5;
-      let wKingR = -1,
-        wKingC = -1,
-        bKingR = -1,
-        bKingC = -1;
-
-      for (let r = 0; r < 8; r++) {
-        for (let c = 0; c < 8; c++) {
-          const p = state.board[r][c];
-          if (!p) continue;
-          if (pieceType(p) === 'K') {
-            if (pieceColor(p) === 'w') {
-              wKingR = r;
-              wKingC = c;
-            } else {
-              bKingR = r;
-              bKingC = c;
-            }
-          }
-        }
+      if (771 < this.inputSize && wKr !== -1) {
+        const dr = wKr - centerR;
+        const dc = wKc - centerC;
+        features[771] = Math.min(Math.sqrt(dr * dr + dc * dc) / 4.0, 1.0);
+      }
+      if (772 < this.inputSize && bKr !== -1) {
+        const dr = bKr - centerR;
+        const dc = bKc - centerC;
+        features[772] = Math.min(Math.sqrt(dr * dr + dc * dc) / 4.0, 1.0);
+      }
+      if (773 < this.inputSize) {
+        features[773] = Math.min(getAllLegalMoves(state).length / 30.0, 1.0);
       }
 
-      if (idxWKingDist < this.inputSize && wKingR !== -1) {
-        const dr = wKingR - centerR;
-        const dc = wKingC - centerC;
-        features[idxWKingDist] = Math.min(
-          Math.sqrt(dr * dr + dc * dc) / 4.0,
-          1.0,
-        );
+      // Optional history-aware extras if your net has room
+      if (774 < this.inputSize) {
+        const key = boardKey(state);
+        const reps = history.fenKeys.filter((k) => k === key).length;
+        features[774] = Math.min(reps / 3, 1.0);
       }
-      if (idxBKingDist < this.inputSize && bKingR !== -1) {
-        const dr = bKingR - centerR;
-        const dc = bKingC - centerC;
-        features[idxBKingDist] = Math.min(
-          Math.sqrt(dr * dr + dc * dc) / 4.0,
-          1.0,
-        );
-      }
-
-      // Mobility
-      if (idxMobility < this.inputSize) {
-        const moves = getAllLegalMoves(state);
-        features[idxMobility] = Math.min(moves.length / 30.0, 1.0);
+      if (775 < this.inputSize) {
+        features[775] = Math.min(history.noProgressPly / 20, 1.0);
       }
     }
 
-    // Run first NNUE layer: clipped ReLU
     const { fc1_weight, fc1_bias } = this.weights;
     for (let i = 0; i < 256; i++) {
       let sum = fc1_bias[i];
@@ -249,19 +277,19 @@ class NNUEEvaluator {
 
   public evaluate(): number {
     if (!this.weights) return 0;
-    const { fc2_weight, fc2_bias } = this.weights;
-    let out = fc2_bias;
+    let out = this.weights.fc2_bias;
     for (let i = 0; i < 256; i++) {
-      out += this.accumulator[i] * fc2_weight[i];
+      out += this.accumulator[i] * this.weights.fc2_weight[i];
     }
-    // Assume output is in pawns from side-to-move perspective; scale to centipawns
     return out * 100;
   }
 }
 
 const evaluator = new NNUEEvaluator();
 
-// ─── Zobrist Hashing + Transposition Table ────────────────────────────────────
+// ──────────────────────────────────────────────────────────────────────────────
+// Zobrist hashing / TT
+// ──────────────────────────────────────────────────────────────────────────────
 
 const ZOBRIST_PIECES = new Uint32Array(12 * 64);
 const ZOBRIST_SIDE = BigInt('0x123456789ABCDEF0');
@@ -293,7 +321,7 @@ function computeZobrist(state: GameState): bigint {
 interface TTEntry {
   depth: number;
   score: number;
-  flag: 0 | 1 | 2; // 0 exact, 1 lower bound, 2 upper bound
+  flag: 0 | 1 | 2;
   move?: Move;
 }
 
@@ -304,13 +332,7 @@ function getTTMove(hash: bigint): Move | undefined {
   return TT.get(hash)?.move;
 }
 
-function storeTT(
-  hash: bigint,
-  depth: number,
-  score: number,
-  flag: 0 | 1 | 2,
-  move?: Move,
-) {
+function storeTT(hash: bigint, depth: number, score: number, flag: 0 | 1 | 2, move?: Move) {
   const existing = TT.get(hash);
   if (!existing || depth >= existing.depth) {
     TT.set(hash, { depth, score, flag, move });
@@ -321,35 +343,112 @@ function storeTT(
   }
 }
 
-// ─── Evaluation wrappers ──────────────────────────────────────────────────────
+// ──────────────────────────────────────────────────────────────────────────────
+// Anti-shuffle penalties
+// ──────────────────────────────────────────────────────────────────────────────
 
-/**
- * Internal eval with ply, used by search.
- */
-function evalWithPly(state: GameState, ply: number): number {
+function antiShufflePenalty(state: GameState, history: HistoryState, lastMove?: Move): number {
+  let penalty = 0;
+
+  const key = boardKey(state);
+  const reps = history.fenKeys.filter((k) => k === key).length;
+
+  // repeated position
+  if (reps >= 1) penalty += 35;
+  if (reps >= 2) penalty += 80;
+  if (reps >= 3) penalty += 200;
+
+  const prev = history.moves[history.moves.length - 1];
+  const prev2 = history.moves[history.moves.length - 2];
+  const prev3 = history.moves[history.moves.length - 3];
+
+  if (lastMove) {
+    // exact bounce back
+    if (isReverseMove(lastMove, prev)) penalty += 120;
+
+    // rook bounce is extra bad
+    if (isRookShuffle(lastMove, prev)) penalty += 180;
+
+    // 2-ply loop pattern
+    if (prev2 && isReverseMove(lastMove, prev2)) penalty += 60;
+
+    // same piece moving again and again without progress
+    if (
+      prev &&
+      lastMove.piece &&
+      prev.piece &&
+      lastMove.piece === prev.piece &&
+      !lastMove.captured &&
+      !lastMove.promotion
+    ) {
+      penalty += 20;
+    }
+
+    if (
+      prev3 &&
+      lastMove.piece &&
+      prev3.piece &&
+      lastMove.piece === prev3.piece &&
+      !lastMove.captured
+    ) {
+      penalty += 20;
+    }
+  }
+
+  // no progress
+  penalty += Math.min(history.noProgressPly * 4, 120);
+
+  return penalty;
+}
+
+function progressBonus(move?: Move, nextState?: GameState): number {
+  if (!move || !nextState) return 0;
+  let bonus = 0;
+  if (move.captured) bonus += 25;
+  if (move.promotion) bonus += 250;
+  if (isInCheck(nextState)) bonus += 30;
+  return bonus;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Evaluation
+// ──────────────────────────────────────────────────────────────────────────────
+
+function evalWithContext(
+  state: GameState,
+  ply: number,
+  history: HistoryState,
+  lastMove?: Move,
+): number {
   const result = getGameResult(state);
+
   if (result === 'checkmate') {
-    return state.turn === 'w' ? -99999 : 99999;
+    // side to move is mated
+    return -99999 + ply;
   }
   if (result === 'stalemate' || result === 'draw-50') {
     return 0;
   }
 
-  evaluator.setPosition(state, ply);
-  return evaluator.evaluate();
+  evaluator.setPosition(state, ply, history);
+  let score = evaluator.evaluate();
+
+  score -= antiShufflePenalty(state, history, lastMove);
+  score += progressBonus(lastMove, state);
+
+  return score;
 }
 
-/**
- * Optional external eval if you want to inspect positions in the UI.
- * Uses ply = 0 here.
- */
 export function evaluate(state: GameState): number {
-  return evalWithPly(state, 0);
+  const history: HistoryState = { fenKeys: [boardKey(state)], moves: [], noProgressPly: 0 };
+  return evalWithContext(state, 0, history);
 }
 
-// ─── Move ordering ────────────────────────────────────────────────────────────
+// ──────────────────────────────────────────────────────────────────────────────
+// Move ordering
+// ──────────────────────────────────────────────────────────────────────────────
 
-function areMovesEqual(a: Move | undefined, b: Move | undefined): boolean {
+function areMovesEqual(a?: Move, b?: Move): boolean {
   if (!a || !b) return false;
   return (
     a.from.r === b.from.r &&
@@ -360,16 +459,12 @@ function areMovesEqual(a: Move | undefined, b: Move | undefined): boolean {
   );
 }
 
-function scoreMoveForOrdering(
-  state: GameState,
-  move: Move,
-  ttMove?: Move,
-): number {
+function scoreMoveForOrdering(state: GameState, move: Move, ttMove?: Move): number {
   if (ttMove && areMovesEqual(move, ttMove)) return 1_000_000;
 
   let score = 0;
-
   const next = applyMove(state, move);
+
   if (isInCheck(next)) score += 50_000;
 
   if (move.captured) {
@@ -380,6 +475,11 @@ function scoreMoveForOrdering(
 
   if (move.promotion) {
     score += 20_000 + (PIECE_VALUE[move.promotion] ?? 0);
+  }
+
+  // discourage rook ping-pong in ordering too
+  if (pieceType(move.piece) === 'R') {
+    score -= 25;
   }
 
   return score;
@@ -393,7 +493,9 @@ function orderMoves(state: GameState, moves: Move[], ttMove?: Move): Move[] {
   );
 }
 
-// ─── Quiescence search ────────────────────────────────────────────────────────
+// ──────────────────────────────────────────────────────────────────────────────
+// Search
+// ──────────────────────────────────────────────────────────────────────────────
 
 let nodesSearched = 0;
 
@@ -402,15 +504,15 @@ function quiescence(
   alpha: number,
   beta: number,
   ply: number,
+  history: HistoryState,
+  lastMove?: Move,
 ): number {
-  const standPat = evalWithPly(state, ply);
+  const standPat = evalWithContext(state, ply, history, lastMove);
   if (standPat >= beta) return beta;
   if (standPat > alpha) alpha = standPat;
 
   const forcingMoves = getAllLegalMoves(state).filter((m) => {
-    const capture = !!m.captured;
-    const givesCheck = isInCheck(applyMove(state, m));
-    return capture || givesCheck;
+    return !!m.captured || isInCheck(applyMove(state, m));
   });
 
   if (forcingMoves.length === 0) return alpha;
@@ -418,7 +520,9 @@ function quiescence(
   const ordered = orderMoves(state, forcingMoves);
   for (const move of ordered) {
     const next = applyMove(state, move);
-    const score = -quiescence(next, -beta, -alpha, ply + 1);
+    const nextHistory = pushHistory(history, next, move);
+    const score = -quiescence(next, -beta, -alpha, ply + 1, nextHistory, move);
+
     if (score >= beta) return beta;
     if (score > alpha) alpha = score;
   }
@@ -426,68 +530,91 @@ function quiescence(
   return alpha;
 }
 
-// ─── Negamax + alpha-beta ─────────────────────────────────────────────────────
-
 function negamax(
   state: GameState,
   depth: number,
   alpha: number,
   beta: number,
   ply: number,
+  history: HistoryState,
+  lastMove?: Move,
 ): number {
   nodesSearched++;
 
   const hash = computeZobrist(state);
   const ttEntry = TT.get(hash);
+
   if (ttEntry && ttEntry.depth >= depth) {
     if (ttEntry.flag === 0) return ttEntry.score;
     if (ttEntry.flag === 1 && ttEntry.score >= beta) return ttEntry.score;
     if (ttEntry.flag === 2 && ttEntry.score <= alpha) return ttEntry.score;
   }
-  const ttMove = ttEntry?.move;
 
   const result = getGameResult(state);
   if (result !== 'ongoing') {
-    if (result === 'checkmate') return -99999;
+    if (result === 'checkmate') return -99999 + ply;
     return 0;
   }
 
   if (depth === 0) {
-    return quiescence(state, alpha, beta, ply);
+    return quiescence(state, alpha, beta, ply, history, lastMove);
   }
 
-  let bestScore = -Infinity;
-  let bestMove: Move | undefined;
-
+  const ttMove = ttEntry?.move;
   const moves = orderMoves(state, getAllLegalMoves(state), ttMove);
+
+  let bestScore = -Infinity;
+  let bestMove: Move | undefined = undefined;
+  const alphaOrig = alpha;
+
   for (const move of moves) {
     const next = applyMove(state, move);
-    const score = -negamax(next, depth - 1, -beta, -alpha, ply + 1);
+    const nextHistory = pushHistory(history, next, move);
+
+    const score = -negamax(
+      next,
+      depth - 1,
+      -beta,
+      -alpha,
+      ply + 1,
+      nextHistory,
+      move,
+    );
 
     if (score > bestScore) {
       bestScore = score;
       bestMove = move;
     }
-    if (bestScore > alpha) alpha = bestScore;
+    if (score > alpha) alpha = score;
     if (alpha >= beta) break;
   }
 
   let flag: 0 | 1 | 2 = 0;
-  if (bestScore <= alpha) flag = 2;
+  if (bestScore <= alphaOrig) flag = 2;
   else if (bestScore >= beta) flag = 1;
+  else flag = 0;
 
   storeTT(hash, depth, bestScore, flag, bestMove);
-
   return bestScore;
 }
 
-// ─── Public search API ────────────────────────────────────────────────────────
+// ──────────────────────────────────────────────────────────────────────────────
+// Public API
+// ──────────────────────────────────────────────────────────────────────────────
 
 export interface AIResult {
   move: Move;
   score: number;
   depth: number;
   nodes: number;
+}
+
+function buildRootHistory(state: GameState): HistoryState {
+  return {
+    fenKeys: [boardKey(state)],
+    moves: [],
+    noProgressPly: 0,
+  };
 }
 
 export async function getBestMove(
@@ -501,31 +628,25 @@ export async function getBestMove(
       TT.clear();
 
       const moves = getAllLegalMoves(state);
-      if (moves.length === 0) {
-        throw new Error('No legal moves');
-      }
+      if (moves.length === 0) throw new Error('No legal moves');
       if (moves.length === 1) {
-        resolve({
-          move: moves[0],
-          score: 0,
-          depth: 0,
-          nodes: 1,
-        });
+        resolve({ move: moves[0], score: 0, depth: 0, nodes: 1 });
         return;
       }
+
+      const rootHistory = buildRootHistory(state);
 
       let bestMove = moves[0];
       let bestScore = -Infinity;
       let completedDepth = 0;
 
-      // Iterative deepening
       for (let depth = 1; depth <= 8; depth++) {
         if (Date.now() - start > timeLimitMs) break;
 
         let depthBestMove = moves[0];
         let depthBestScore = -Infinity;
         let alpha = -Infinity;
-        let beta = Infinity;
+        const beta = Infinity;
 
         const hash = computeZobrist(state);
         const ttMove = getTTMove(hash);
@@ -535,7 +656,17 @@ export async function getBestMove(
           if (Date.now() - start > timeLimitMs) break;
 
           const next = applyMove(state, move);
-          const score = -negamax(next, depth - 1, -beta, -alpha, 1); // ply = 1 at root
+          const nextHistory = pushHistory(rootHistory, next, move);
+
+          const score = -negamax(
+            next,
+            depth - 1,
+            -beta,
+            -alpha,
+            1,
+            nextHistory,
+            move,
+          );
 
           if (score > depthBestScore) {
             depthBestScore = score;
@@ -544,11 +675,9 @@ export async function getBestMove(
           if (score > alpha) alpha = score;
         }
 
-        if (depthBestMove) {
-          bestMove = depthBestMove;
-          bestScore = depthBestScore;
-          completedDepth = depth;
-        }
+        bestMove = depthBestMove;
+        bestScore = depthBestScore;
+        completedDepth = depth;
       }
 
       resolve({
@@ -561,15 +690,15 @@ export async function getBestMove(
   });
 }
 
-// ─── NNUE init ────────────────────────────────────────────────────────────────
+// ──────────────────────────────────────────────────────────────────────────────
+// Init
+// ──────────────────────────────────────────────────────────────────────────────
 
 let initialized = false;
 
-export async function initAI(
-  modelUrl: string = '/best_network.nnue',
-): Promise<void> {
+export async function initAI(modelUrl: string = '/best_network.nnue'): Promise<void> {
   if (initialized) return;
   await evaluator.loadWeights(modelUrl);
   initialized = true;
-  console.log('AI initialized with trained NNUE model');
+  console.log('AI initialized with trained NNUE model + anti-shuffle penalties');
 }
