@@ -1,7 +1,7 @@
 /**
  * Chess AI Engine (fixed)
  * -----------------------
- * - Negamax with alpha–beta pruning
+ * - Negamax + alpha-beta pruning
  * - Iterative deepening
  * - Zobrist hashing + transposition table
  * - NNUE evaluation using all available input features (768 or 784)
@@ -17,7 +17,7 @@ import {
   getGameResult,
 } from './chess';
 
-// ─── Piece values (fallback for ordering) ─────────────────────────────────────
+// ─── Piece values (for move ordering) ─────────────────────────────────────────
 
 const PIECE_VALUE: Record<string, number> = {
   P: 100,
@@ -40,7 +40,7 @@ interface NNUEWeights {
 class NNUEEvaluator {
   private weights: NNUEWeights | null = null;
   private accumulator: Float32Array = new Float32Array(256);
-  private inputSize = 768; // 12 * 64; may become 784 if model uses extra features
+  private inputSize = 768; // 12 * 64; will be updated from file
 
   private pieceMap: Record<string, number> = {
     wP: 0,
@@ -63,7 +63,7 @@ class NNUEEvaluator {
     const data = new DataView(buffer);
     let offset = 0;
 
-    // Header "NNUE"
+    // Magic "NNUE"
     const magic =
       String.fromCharCode(data.getUint8(0)) +
       String.fromCharCode(data.getUint8(1)) +
@@ -98,7 +98,11 @@ class NNUEEvaluator {
     this.inputSize = inferredInputSize;
     const fc1_weight: Float32Array[] = [];
     for (let i = 0; i < 256; i++) {
-      const row = new Float32Array(buffer, offset + i * this.inputSize * 4, this.inputSize);
+      const row = new Float32Array(
+        buffer,
+        offset + i * this.inputSize * 4,
+        this.inputSize,
+      );
       fc1_weight.push(row);
     }
     offset += fc1_len * 4;
@@ -126,13 +130,12 @@ class NNUEEvaluator {
   }
 
   /**
-   * Build feature vector from board and move number, then run first NNUE layer.
-   * Returns the feature vector (for debugging if needed).
+   * Build feature vector from board and ply, then run the first NNUE layer.
    */
-  public setPosition(state: GameState, ply: number): Float32Array {
+  public setPosition(state: GameState, ply: number): void {
     if (!this.weights) {
       this.accumulator.fill(0);
-      return new Float32Array(this.inputSize);
+      return;
     }
 
     const features = new Float32Array(this.inputSize);
@@ -158,7 +161,7 @@ class NNUEEvaluator {
       }
     }
 
-    // 2) Extra features if the network expects >768 inputs (e.g. 784).
+    // 2) Extra features if network expects >768 inputs (e.g. 784)
     if (this.inputSize > 768) {
       const idxCheck = 768;
       const idxPly = 769;
@@ -172,10 +175,9 @@ class NNUEEvaluator {
         features[idxCheck] = isInCheck(state) ? 1.0 : 0.0;
       }
 
-      // Normalized ply (0..1 roughly over first ~80 plies)
+      // Normalized ply (0..1)
       if (idxPly < this.inputSize) {
-        const normPly = Math.min(ply / 80, 1.0);
-        features[idxPly] = normPly;
+        features[idxPly] = Math.min(ply / 80, 1.0);
       }
 
       // Turn indicator
@@ -190,6 +192,7 @@ class NNUEEvaluator {
         wKingC = -1,
         bKingR = -1,
         bKingC = -1;
+
       for (let r = 0; r < 8; r++) {
         for (let c = 0; c < 8; c++) {
           const p = state.board[r][c];
@@ -205,15 +208,22 @@ class NNUEEvaluator {
           }
         }
       }
+
       if (idxWKingDist < this.inputSize && wKingR !== -1) {
         const dr = wKingR - centerR;
         const dc = wKingC - centerC;
-        features[idxWKingDist] = Math.min(Math.sqrt(dr * dr + dc * dc) / 4.0, 1.0);
+        features[idxWKingDist] = Math.min(
+          Math.sqrt(dr * dr + dc * dc) / 4.0,
+          1.0,
+        );
       }
       if (idxBKingDist < this.inputSize && bKingR !== -1) {
         const dr = bKingR - centerR;
         const dc = bKingC - centerC;
-        features[idxBKingDist] = Math.min(Math.sqrt(dr * dr + dc * dc) / 4.0, 1.0);
+        features[idxBKingDist] = Math.min(
+          Math.sqrt(dr * dr + dc * dc) / 4.0,
+          1.0,
+        );
       }
 
       // Mobility
@@ -223,7 +233,7 @@ class NNUEEvaluator {
       }
     }
 
-    // Run first NNUE layer: acc = ReLU_clipped(fc1(features))
+    // Run first NNUE layer: clipped ReLU
     const { fc1_weight, fc1_bias } = this.weights;
     for (let i = 0; i < 256; i++) {
       let sum = fc1_bias[i];
@@ -231,13 +241,10 @@ class NNUEEvaluator {
       for (let j = 0; j < this.inputSize; j++) {
         sum += row[j] * features[j];
       }
-      // Clipped ReLU 0..1
       if (sum < 0) sum = 0;
       else if (sum > 1) sum = 1;
       this.accumulator[i] = sum;
     }
-
-    return features;
   }
 
   public evaluate(): number {
@@ -247,14 +254,14 @@ class NNUEEvaluator {
     for (let i = 0; i < 256; i++) {
       out += this.accumulator[i] * fc2_weight[i];
     }
-    // Assumed to be value from side to move, in pawns; scale to centipawns
+    // Assume output is in pawns from side-to-move perspective; scale to centipawns
     return out * 100;
   }
 }
 
 const evaluator = new NNUEEvaluator();
 
-// ─── Zobrist Hashing & Transposition Table ────────────────────────────────────
+// ─── Zobrist Hashing + Transposition Table ────────────────────────────────────
 
 const ZOBRIST_PIECES = new Uint32Array(12 * 64);
 const ZOBRIST_SIDE = BigInt('0x123456789ABCDEF0');
@@ -286,7 +293,7 @@ function computeZobrist(state: GameState): bigint {
 interface TTEntry {
   depth: number;
   score: number;
-  flag: 0 | 1 | 2; // 0 = exact, 1 = lower bound, 2 = upper bound
+  flag: 0 | 1 | 2; // 0 exact, 1 lower bound, 2 upper bound
   move?: Move;
 }
 
@@ -314,9 +321,12 @@ function storeTT(
   }
 }
 
-// ─── Evaluation wrapper ───────────────────────────────────────────────────────
+// ─── Evaluation wrappers ──────────────────────────────────────────────────────
 
-export function evaluate(state: GameState, ply: number): number {
+/**
+ * Internal eval with ply, used by search.
+ */
+function evalWithPly(state: GameState, ply: number): number {
   const result = getGameResult(state);
   if (result === 'checkmate') {
     return state.turn === 'w' ? -99999 : 99999;
@@ -326,12 +336,18 @@ export function evaluate(state: GameState, ply: number): number {
   }
 
   evaluator.setPosition(state, ply);
-  const nnueScore = evaluator.evaluate();
-
-  return nnueScore;
+  return evaluator.evaluate();
 }
 
-// ─── Move ordering helpers ────────────────────────────────────────────────────
+/**
+ * Optional external eval if you want to inspect positions in the UI.
+ * Uses ply = 0 here.
+ */
+export function evaluate(state: GameState): number {
+  return evalWithPly(state, 0);
+}
+
+// ─── Move ordering ────────────────────────────────────────────────────────────
 
 function areMovesEqual(a: Move | undefined, b: Move | undefined): boolean {
   if (!a || !b) return false;
@@ -349,23 +365,19 @@ function scoreMoveForOrdering(
   move: Move,
   ttMove?: Move,
 ): number {
-  // TT move first
   if (ttMove && areMovesEqual(move, ttMove)) return 1_000_000;
 
   let score = 0;
 
-  // Check moves
   const next = applyMove(state, move);
   if (isInCheck(next)) score += 50_000;
 
-  // Captures (MVV-LVA style)
   if (move.captured) {
     const attacker = PIECE_VALUE[move.piece[1]] ?? 0;
     const victim = PIECE_VALUE[move.captured[1]] ?? 0;
     score += 10_000 + (victim * 10 - attacker);
   }
 
-  // Promotions
   if (move.promotion) {
     score += 20_000 + (PIECE_VALUE[move.promotion] ?? 0);
   }
@@ -391,7 +403,7 @@ function quiescence(
   beta: number,
   ply: number,
 ): number {
-  const standPat = evaluate(state, ply);
+  const standPat = evalWithPly(state, ply);
   if (standPat >= beta) return beta;
   if (standPat > alpha) alpha = standPat;
 
@@ -414,7 +426,7 @@ function quiescence(
   return alpha;
 }
 
-// ─── Negamax with alpha–beta ──────────────────────────────────────────────────
+// ─── Negamax + alpha-beta ─────────────────────────────────────────────────────
 
 function negamax(
   state: GameState,
@@ -461,15 +473,15 @@ function negamax(
   }
 
   let flag: 0 | 1 | 2 = 0;
-  if (bestScore <= alpha) flag = 2; // upper bound
-  else if (bestScore >= beta) flag = 1; // lower bound
+  if (bestScore <= alpha) flag = 2;
+  else if (bestScore >= beta) flag = 1;
 
   storeTT(hash, depth, bestScore, flag, bestMove);
 
   return bestScore;
 }
 
-// ─── Public API ───────────────────────────────────────────────────────────────
+// ─── Public search API ────────────────────────────────────────────────────────
 
 export interface AIResult {
   move: Move;
@@ -502,9 +514,6 @@ export async function getBestMove(
         return;
       }
 
-      // Increment a global ply counter each AI turn to feed into NNUE extras
-      GAME_MOVE_NUMBER++;
-
       let bestMove = moves[0];
       let bestScore = -Infinity;
       let completedDepth = 0;
@@ -526,13 +535,7 @@ export async function getBestMove(
           if (Date.now() - start > timeLimitMs) break;
 
           const next = applyMove(state, move);
-          const score = -negamax(
-            next,
-            depth - 1,
-            -beta,
-            -alpha,
-            GAME_MOVE_NUMBER + 1,
-          );
+          const score = -negamax(next, depth - 1, -beta, -alpha, 1); // ply = 1 at root
 
           if (score > depthBestScore) {
             depthBestScore = score;
@@ -558,7 +561,8 @@ export async function getBestMove(
   });
 }
 
-// Initialize NNUE from your trained .nnue in /public
+// ─── NNUE init ────────────────────────────────────────────────────────────────
+
 let initialized = false;
 
 export async function initAI(
